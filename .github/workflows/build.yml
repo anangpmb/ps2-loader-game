@@ -1,4 +1,4 @@
-name: Build Desktop App
+name: Build & Release
 
 on:
   push:
@@ -7,7 +7,7 @@ on:
 
 jobs:
   build-macos:
-    name: macOS (ARM + Intel)
+    name: macOS
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -21,13 +21,17 @@ jobs:
         with:
           targets: aarch64-apple-darwin,x86_64-apple-darwin
 
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - name: Install frontend deps
         run: npm install
 
       - name: Build ARM64
         run: npx tauri build --target aarch64-apple-darwin
         env:
-          # No code signing — skip Apple Developer
           APPLE_SIGNING_IDENTITY: ""
 
       - name: Build Intel
@@ -35,30 +39,20 @@ jobs:
         env:
           APPLE_SIGNING_IDENTITY: ""
 
-      - name: Rename artifacts
-        run: |
-          cd src-tauri/target/aarch64-apple-darwin/release/bundle
-          mv dmg/*.dmg "../../../../../PS2-Backup-Tool-macOS-ARM.dmg" 2>/dev/null || true
-          cd ../../../..
-
-          cd src-tauri/target/x86_64-apple-darwin/release/bundle
-          mv dmg/*.dmg "../../../../../PS2-Backup-Tool-macOS-Intel.dmg" 2>/dev/null || true
-          cd ../../../..
-
-      - name: Upload macOS ARM
+      - name: Upload macOS ARM DMG
         uses: actions/upload-artifact@v4
         with:
-          name: macOS-ARM
-          path: PS2-Backup-Tool-macOS-ARM.dmg
+          name: PS2-Backup-Tool-macOS-ARM.dmg
+          path: src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
 
-      - name: Upload macOS Intel
+      - name: Upload macOS Intel DMG
         uses: actions/upload-artifact@v4
         with:
-          name: macOS-Intel
-          path: PS2-Backup-Tool-macOS-Intel.dmg
+          name: PS2-Backup-Tool-macOS-Intel.dmg
+          path: src-tauri/target/x86_64-apple-darwin/release/bundle/dmg/*.dmg
 
   build-windows:
-    name: Windows (x64)
+    name: Windows
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
@@ -70,41 +64,53 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
       - name: Install frontend deps
         run: npm install
 
       - name: Build
         run: npx tauri build
 
-      - name: Rename artifacts
+      - name: Find MSI
+        id: find-msi
         shell: pwsh
         run: |
-          $dmg = Get-ChildItem -Path src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($dmg) { Copy-Item $dmg.FullName "PS2-Backup-Tool-Windows.msi" }
+          $msi = Get-ChildItem -Path src-tauri/target/release/bundle/msi/*.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($msi) { echo "msi_path=$($msi.FullName)" >> $env:GITHUB_OUTPUT }
 
+      - name: Find EXE
+        id: find-exe
+        shell: pwsh
+        run: |
           $exe = Get-ChildItem -Path src-tauri/target/release/bundle/nsis/*.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($exe) { Copy-Item $exe.FullName "PS2-Backup-Tool-Windows.exe" }
-
-          $nsis = Get-ChildItem -Path src-tauri/target/release/*.exe -ErrorAction SilentlyContinue | Select-Object -First 1
-          if ($nsis -and -not (Test-Path "PS2-Backup-Tool-Windows.exe")) { Copy-Item $nsis.FullName "PS2-Backup-Tool-Windows.exe" }
+          if (-not $exe) {
+            $exe = Get-ChildItem -Path src-tauri/target/release/*.exe -ErrorAction SilentlyContinue | Where-Object { $_.Name -notmatch 'build|incremental' } | Select-Object -First 1
+          }
+          if ($exe) { echo "exe_path=$($exe.FullName)" >> $env:GITHUB_OUTPUT }
 
       - name: Upload Windows MSI
+        if: steps.find-msi.outputs.msi_path
         uses: actions/upload-artifact@v4
         with:
-          name: Windows-MSI
-          path: PS2-Backup-Tool-Windows.msi
+          name: PS2-Backup-Tool-Windows.msi
+          path: ${{ steps.find-msi.outputs.msi_path }}
 
       - name: Upload Windows EXE
+        if: steps.find-exe.outputs.exe_path
         uses: actions/upload-artifact@v4
         with:
-          name: Windows-EXE
-          path: PS2-Backup-Tool-Windows.exe
+          name: PS2-Backup-Tool-Windows.exe
+          path: ${{ steps.find-exe.outputs.exe_path }}
 
   release:
-    name: Create Release
+    name: Release
     needs: [build-macos, build-windows]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: always() && startsWith(github.ref, 'refs/tags/')
     permissions:
       contents: write
     steps:
@@ -112,30 +118,39 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          merge-multiple: true
 
-      - name: List artifacts
-        run: find artifacts -type f
+      - name: List files
+        run: find artifacts -type f || true
 
-      - name: Create Release
+      - name: Collect release files
+        id: files
+        run: |
+          FILES=""
+          for f in artifacts/*.dmg artifacts/*.msi artifacts/*.exe; do
+            [ -f "$f" ] && FILES="$FILES"$'\n'"$f"
+          done
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "Found files:"
+          echo "$FILES"
+
+      - name: Upload to Release
+        if: steps.files.outputs.files != ''
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            artifacts/**/*.dmg
-            artifacts/**/*.msi
-            artifacts/**/*.exe
+          files: ${{ steps.files.outputs.files }}
           body: |
             ## PS2 Backup Tool ${{ github.ref_name }}
 
-            ### Downloads
             | Platform | File |
             |----------|------|
             | macOS (Apple Silicon) | `PS2-Backup-Tool-macOS-ARM.dmg` |
             | macOS (Intel) | `PS2-Backup-Tool-macOS-Intel.dmg` |
             | Windows (Installer) | `PS2-Backup-Tool-Windows.msi` |
             | Windows (Portable) | `PS2-Backup-Tool-Windows.exe` |
+            | Web | [GitHub Pages](https://${{ github.repository_owner }}.github.io/${{ github.event.repository.name }}/) |
 
-            ### Notes
-            - **macOS**: Unsigned app — right-click > Open on first launch
-            - **Windows**: Unsigned app — click "More info" > "Run anyway" on SmartScreen warning
-          draft: false
-          prerelease: false
+            > macOS: right-click → Open on first launch
+            > Windows: "More info" → "Run anyway"
