@@ -107,8 +107,10 @@ where
     for chunk_idx in 0..total_chunks {
         let chunk_file_name = if total_chunks == 1 {
             format!("ul.{}", game_id)
+        } else if chunk_idx == 0 {
+            format!("ul.{}", game_id)
         } else {
-            format!("ul.{:02}", chunk_idx)
+            format!("ul.{}.{:02}", game_id, chunk_idx)
         };
         let chunk_path = dest_dir.join(&chunk_file_name);
 

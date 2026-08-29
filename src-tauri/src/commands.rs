@@ -122,14 +122,16 @@ pub async fn process_iso(
     // No-split mode uses CD/DVD directories — OPL scans those directly
     if use_split {
         let ulcfg_path = ulcfg::ulcfg_path(&PathBuf::from(&dest_dir));
-        let entry = UlEntry {
-            title: ulcfg::extract_title(
+        let title = read_iso_title(&source_path)
+            .unwrap_or_else(|| ulcfg::extract_title(
                 source_path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
                     .unwrap_or_default()
                     .as_str(),
-            ),
+            ));
+        let entry = UlEntry {
+            title,
             game_id,
             parts: result.chunks.len() as u16,
             mount_point: dest_dir,
@@ -174,8 +176,13 @@ pub fn generate_ulcfg(dest_dir: String) -> Result<usize, String> {
                         }
                     }
 
+                    // Try reading title from the first split chunk (contains ISO header)
+                    let first_chunk = dest_path.join(format!("ul.{}", game_id));
+                    let title = read_iso_title(&first_chunk)
+                        .unwrap_or_else(|| game_id.clone());
+
                     entries.push(UlEntry {
-                        title: game_id.clone(),
+                        title,
                         game_id,
                         parts: parts.max(1),
                         mount_point: dest_dir.clone(),
@@ -247,10 +254,10 @@ pub fn list_device_games(dest_dir: String) -> Result<Vec<GameEntry>, String> {
         for entry in entries {
             let mut total_size: u64 = 0;
             for i in 0..entry.parts {
-                let part_name = if entry.parts == 1 {
+                let part_name = if i == 0 || entry.parts == 1 {
                     format!("ul.{}", entry.game_id)
                 } else {
-                    format!("ul.{:02}", i)
+                    format!("ul.{}.{:02}", entry.game_id, i)
                 };
                 if let Ok(meta) = std::fs::metadata(dest_path.join(&part_name)) {
                     total_size += meta.len();
@@ -345,7 +352,7 @@ pub fn delete_game(dest_dir: String, game_id: String, mode: String, location: St
     } else {
         // Delete ul.xxx files and ul.cfg entry
         for i in 0..100 {
-            let name = if i == 0 { format!("ul.{}", game_id) } else { format!("ul.{:02}", i) };
+            let name = if i == 0 { format!("ul.{}", game_id) } else { format!("ul.{}.{:02}", game_id, i) };
             let path = dest_path.join(&name);
             if path.exists() {
                 std::fs::remove_file(&path).map_err(|e| format!("Failed to delete {}: {}", name, e))?;

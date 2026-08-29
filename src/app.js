@@ -589,7 +589,7 @@ const App = (() => {
           const dir = await destDirHandle.getDirectoryHandle(location, { create: false });
           await dir.removeEntry(`${gameId}.iso`);
         } else {
-          for (const name of await destDirHandle.keys()) {
+          for await (const name of destDirHandle.keys()) {
             if (name === `ul.${gameId}` || name.startsWith(`ul.${gameId}.`)) {
               await destDirHandle.removeEntry(name);
             }
