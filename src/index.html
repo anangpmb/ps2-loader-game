@@ -21,8 +21,8 @@
           </svg>
         </div>
         <div>
-          <div class="header__title">PS2 BACKUP TOOL</div>
-          <div class="header__subtitle">OPL Manager + USBUtil — ISO to USBExtreme</div>
+          <div class="header__title">PS2 Backup Tool</div>
+          <div class="header__subtitle">ISO to USBExtreme for OPL</div>
         </div>
       </div>
       <div class="header__actions">
@@ -137,17 +137,12 @@
             </button>
           </div>
           <div class="card__body">
+            <div style="margin-bottom:var(--space-3)">
+              <select id="device-select" style="width:100%;padding:var(--space-2) var(--space-3);background:var(--color-bg-surface);border:1px solid var(--color-border);border-radius:var(--radius-md);color:var(--color-text-primary);font-family:var(--font-mono);font-size:var(--text-sm)">
+                <option value="">No device detected</option>
+              </select>
+            </div>
             <div class="device-info" id="device-info">
-              <div class="device-info__item">
-                <div class="device-info__icon">
-                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
-                </div>
-                <div>
-                  <div class="device-info__label">Device</div>
-                  <div class="device-info__value" id="device-name">No device detected</div>
-                </div>
-              </div>
-              <div class="device-info__item">
                 <div class="device-info__icon">
                   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12H2"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
                 </div>
@@ -200,6 +195,24 @@
           </div>
         </div>
 
+        <!-- Games on Device -->
+        <div class="card animate-in" style="animation-delay: 275ms">
+          <div class="card__header">
+            <div class="card__title">Games on Device</div>
+            <button class="btn btn--ghost btn--sm" id="btn-refresh-games">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+              Scan
+            </button>
+          </div>
+          <div class="card__body" style="padding:0">
+            <div id="device-games-list" style="max-height:260px;overflow-y:auto;padding:var(--space-3)">
+              <div style="text-align:center;color:var(--color-text-muted);font-size:var(--text-sm);padding:var(--space-4)">
+                Click Scan to check device
+              </div>
+            </div>
+          </div>
+        </div>
+
         <!-- Quick Actions -->
         <div class="card animate-in" style="animation-delay: 300ms">
           <div class="card__header">
@@ -233,7 +246,7 @@
   <div class="modal-overlay" id="modal-settings">
     <div class="modal">
       <div class="modal__header">
-        <div class="modal__title">SETTINGS</div>
+        <div class="modal__title">Settings</div>
         <button class="modal__close" data-close="modal-settings">&times;</button>
       </div>
       <div class="modal__body">

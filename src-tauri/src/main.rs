@@ -16,6 +16,7 @@ fn main() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::detect_device,
+            commands::list_devices,
             commands::validate_iso,
             commands::process_iso,
             commands::generate_ulcfg,

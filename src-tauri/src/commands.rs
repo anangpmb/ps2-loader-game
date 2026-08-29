@@ -49,10 +49,16 @@ impl AppSettings {
     }
 }
 
-/// Detect connected removable storage device.
+/// Detect connected removable storage device (first one).
 #[tauri::command]
 pub fn detect_device() -> Result<DeviceInfo, String> {
     filesystem::detect_primary_device().map_err(|e| e.to_string())
+}
+
+/// List all connected removable storage devices.
+#[tauri::command]
+pub fn list_devices() -> Result<Vec<DeviceInfo>, String> {
+    filesystem::detect_devices().map_err(|e| e.to_string())
 }
 
 /// Validate a PS2 ISO file.
@@ -112,22 +118,24 @@ pub async fn process_iso(
     .map_err(|e| format!("Task failed: {}", e))?
     .map_err(|e| e.to_string())?;
 
-    // Update ul.cfg
-    let ulcfg_path = ulcfg::ulcfg_path(&PathBuf::from(&dest_dir));
-    let entry = UlEntry {
-        title: ulcfg::extract_title(
-            source_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default()
-                .as_str(),
-        ),
-        game_id,
-        parts: result.chunks.len() as u16,
-        mount_point: dest_dir,
-    };
-
-    ulcfg::add_entry(&ulcfg_path, &entry).map_err(|e| e.to_string())?;
+    // Update ul.cfg only for split mode (USBExtreme format)
+    // No-split mode uses CD/DVD directories — OPL scans those directly
+    if use_split {
+        let ulcfg_path = ulcfg::ulcfg_path(&PathBuf::from(&dest_dir));
+        let entry = UlEntry {
+            title: ulcfg::extract_title(
+                source_path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default()
+                    .as_str(),
+            ),
+            game_id,
+            parts: result.chunks.len() as u16,
+            mount_point: dest_dir,
+        };
+        ulcfg::add_entry(&ulcfg_path, &entry).map_err(|e| e.to_string())?;
+    }
 
     Ok(result)
 }
@@ -217,11 +225,93 @@ pub struct VerifyResult {
     pub errors: usize,
 }
 
-/// List games already on the device.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GameEntry {
+    pub game_id: String,
+    pub title: String,
+    pub parts: u16,
+    pub size: u64,
+    pub location: String, // "root/ul.xxx", "CD/xxx.iso", "DVD/xxx.iso"
+    pub mode: String,     // "split" or "nosplit"
+}
+
+/// List all games on the device (ul.cfg + ul.* files + CD/DVD ISOs).
 #[tauri::command]
-pub fn list_device_games(dest_dir: String) -> Result<Vec<UlEntry>, String> {
-    let ulcfg_path = ulcfg::ulcfg_path(&PathBuf::from(&dest_dir));
-    ulcfg::parse_ulcfg(&ulcfg_path).map_err(|e| e.to_string())
+pub fn list_device_games(dest_dir: String) -> Result<Vec<GameEntry>, String> {
+    let dest_path = PathBuf::from(&dest_dir);
+    let mut games: Vec<GameEntry> = Vec::new();
+
+    // 1. Parse ul.cfg for split-mode entries
+    let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
+    if let Ok(entries) = ulcfg::parse_ulcfg(&ulcfg_path) {
+        for entry in entries {
+            let mut total_size: u64 = 0;
+            for i in 0..entry.parts {
+                let part_name = if entry.parts == 1 {
+                    format!("ul.{}", entry.game_id)
+                } else {
+                    format!("ul.{:02}", i)
+                };
+                if let Ok(meta) = std::fs::metadata(dest_path.join(&part_name)) {
+                    total_size += meta.len();
+                }
+            }
+            games.push(GameEntry {
+                game_id: entry.game_id,
+                title: entry.title,
+                parts: entry.parts,
+                size: total_size,
+                location: "root".into(),
+                mode: "split".into(),
+            });
+        }
+    }
+
+    // 2. Scan CD/ and DVD/ for no-split ISOs
+    for subdir in &["CD", "DVD"] {
+        let dir = dest_path.join(subdir);
+        if !dir.exists() { continue; }
+        if let Ok(read_dir) = std::fs::read_dir(&dir) {
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if !name.ends_with(".iso") { continue; }
+                let game_id = name.strip_suffix(".iso").unwrap_or(&name).to_string();
+                if game_id.is_empty() { continue; }
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                games.push(GameEntry {
+                    game_id: game_id.clone(),
+                    title: game_id,
+                    parts: 1,
+                    size,
+                    location: subdir.to_string(),
+                    mode: "nosplit".into(),
+                });
+            }
+        }
+    }
+
+    // 3. Fallback: scan root for ul.* files not in ul.cfg
+    if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
+        let known_ids: Vec<String> = games.iter().map(|g| g.game_id.clone()).collect();
+        for entry in read_dir.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.starts_with("ul.") || name == "ul.cfg" { continue; }
+            let game_id = name.strip_prefix("ul.").unwrap_or(&name)
+                .split('.').next().unwrap_or("").to_string();
+            if game_id.is_empty() || known_ids.contains(&game_id) { continue; }
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            games.push(GameEntry {
+                game_id: game_id.clone(),
+                title: game_id,
+                parts: 1,
+                size,
+                location: "root".into(),
+                mode: "split".into(),
+            });
+        }
+    }
+
+    Ok(games)
 }
 
 /// Get current app settings.

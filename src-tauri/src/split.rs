@@ -299,6 +299,8 @@ fn verify_chunk(path: &Path, expected_checksum: &str, config: &SplitConfig) -> R
 }
 
 /// Copy ISO as-is (no-split mode for NTFS/exFAT).
+/// OPL convention: files go in CD/ or DVD/ directory based on size.
+/// Games < ~4.37 GB (single-layer DVD) go in CD/, larger ones in DVD/.
 pub fn copy_iso_nosplit<F>(
     source: &Path,
     dest_dir: &Path,
@@ -309,12 +311,18 @@ pub fn copy_iso_nosplit<F>(
 where
     F: FnMut(ProgressInfo),
 {
-    let dest_path = dest_dir.join(format!("ul.{}", game_id));
-
     let file = File::open(source)?;
     let file_size = file.metadata()?.len();
-    let mut reader = BufReader::with_capacity(config.buffer_size, file);
 
+    // OPL convention: CD for small games, DVD for large ones
+    // Single-layer DVD capacity ~4.37 GB = 4_700_000_000 bytes
+    let subdir = if file_size < 4_700_000_000 { "CD" } else { "DVD" };
+    let target_dir = dest_dir.join(subdir);
+    std::fs::create_dir_all(&target_dir)?;
+
+    let dest_path = target_dir.join(format!("{}.iso", game_id));
+
+    let mut reader = BufReader::with_capacity(config.buffer_size, file);
     let checksum = write_chunk(&mut reader, &dest_path, file_size, config)?;
 
     on_progress(ProgressInfo {

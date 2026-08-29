@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Rust build output
+src-tauri/target/
+
+# Tauri generated
+src-tauri/gen/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Lock files (optional — uncomment if you prefer not to commit)
+# package-lock.json
+# src-tauri/Cargo.lock

@@ -21,26 +21,35 @@ const App = (() => {
   let destDirHandle = null;
 
   const Tauri = {
-    async detectDevice() {
+    async listDevices() {
       if (invoke) {
-        return invoke('detect_device');
+        return invoke('list_devices');
       }
+      // Browser: prompt for folder, return as single device
       if (!destDirHandle) {
         try {
           destDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-          log('success', `Destination folder: ${destDirHandle.name}`);
         } catch (e) {
-          throw new Error('No destination folder selected');
+          return [];
         }
       }
-      return {
+      return destDirHandle ? [{
         name: destDirHandle.name,
         filesystem: 'Browser FS',
         free_space: 0,
         total_space: 0,
         recommended_mode: 'nosplit',
         mount_point: destDirHandle.name,
-      };
+      }] : [];
+    },
+
+    async detectDevice() {
+      if (invoke) {
+        return invoke('detect_device');
+      }
+      const devices = await this.listDevices();
+      if (devices.length === 0) throw new Error('No device selected');
+      return devices[0];
     },
 
     async validateISO(file) {
@@ -82,16 +91,33 @@ const App = (() => {
       if (!queueItem.file) throw new Error('No file data. Re-drop the ISO.');
 
       const gameId = queueItem.gameId || queueItem.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_');
+      const fileSize = queueItem.file.size;
+      const isSplit = item.mode === 'split';
       const CHUNK_SIZE = 0xFFFF0000;
-      const totalChunks = Math.ceil(queueItem.file.size / CHUNK_SIZE);
+      const totalChunks = isSplit ? Math.ceil(fileSize / CHUNK_SIZE) : 1;
+
+      // Determine target directory
+      let targetDir = destDirHandle;
+      if (!isSplit) {
+        // OPL convention: CD for small games, DVD for large ones
+        const subdir = fileSize < 4_700_000_000 ? 'CD' : 'DVD';
+        targetDir = await destDirHandle.getDirectoryHandle(subdir, { create: true });
+        log('info', `No-split mode: writing to ${subdir}/ directory`);
+      }
 
       for (let i = 0; i < totalChunks; i++) {
-        const fileName = totalChunks === 1 ? `ul.${gameId}` : `ul.${String(i).padStart(2, '0')}`;
+        let fileName;
+        if (isSplit) {
+          fileName = totalChunks === 1 ? `ul.${gameId}` : `ul.${String(i).padStart(2, '0')}`;
+        } else {
+          fileName = `${gameId}.iso`;
+        }
+
         const chunkStart = i * CHUNK_SIZE;
-        const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, queueItem.file.size);
+        const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, fileSize);
         const chunkBlob = queueItem.file.slice(chunkStart, chunkEnd);
 
-        const fileHandle = await destDirHandle.getFileHandle(fileName, { create: true });
+        const fileHandle = await targetDir.getFileHandle(fileName, { create: true });
         const writable = await fileHandle.createWritable();
         const reader = chunkBlob.stream().getReader();
         let written = 0;
@@ -122,31 +148,39 @@ const App = (() => {
 
       // Verify
       onProgress({ phase: 'verify', pct: 0 });
-      const firstChunkName = totalChunks === 1 ? `ul.${gameId}` : 'ul.00';
-      const verifyHandle = await destDirHandle.getFileHandle(firstChunkName);
+      const verifyName = isSplit
+        ? (totalChunks === 1 ? `ul.${gameId}` : 'ul.00')
+        : `${gameId}.iso`;
+      const verifyDir = isSplit ? destDirHandle : targetDir;
+      const verifyHandle = await verifyDir.getFileHandle(verifyName);
       const verifyFile = await verifyHandle.getFile();
       if (verifyFile.size === 0) throw new Error('Verification failed: written file is empty');
       onProgress({ phase: 'verify', pct: 100 });
 
-      // ul.cfg
-      onProgress({ phase: 'ulcfg', pct: 0 });
-      try {
-        let ulcfgContent = '';
+      // ul.cfg only for split mode
+      if (isSplit) {
+        onProgress({ phase: 'ulcfg', pct: 0 });
         try {
-          const existing = await destDirHandle.getFileHandle('ul.cfg');
-          ulcfgContent = await (await existing.getFile()).text();
-        } catch (e) {}
-        const title = queueItem.name.replace(/\.[^.]+$/, '');
-        const lines = ulcfgContent.split('\n').filter(l => l && !l.startsWith(gameId + '\t'));
-        lines.push(`${gameId}\t${title}\t${totalChunks}`);
-        const ulcfgHandle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
-        const w = await ulcfgHandle.createWritable();
-        await w.write(lines.join('\n'));
-        await w.close();
-      } catch (e) {
-        log('warn', `ul.cfg write failed: ${e.message}`);
+          let ulcfgContent = '';
+          try {
+            const existing = await destDirHandle.getFileHandle('ul.cfg');
+            ulcfgContent = await (await existing.getFile()).text();
+          } catch (e) {}
+          const title = queueItem.name.replace(/\.[^.]+$/, '');
+          const lines = ulcfgContent.split('\n').filter(l => l && !l.startsWith(gameId + '\t'));
+          lines.push(`${gameId}\t${title}\t${totalChunks}`);
+          const ulcfgHandle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
+          const w = await ulcfgHandle.createWritable();
+          await w.write(lines.join('\n'));
+          await w.close();
+        } catch (e) {
+          log('warn', `ul.cfg write failed: ${e.message}`);
+        }
+        onProgress({ phase: 'ulcfg', pct: 100 });
+      } else {
+        onProgress({ phase: 'ulcfg', pct: 100 });
+        log('info', `No-split mode: ul.cfg not needed (file in ${fileSize < 4_700_000_000 ? 'CD' : 'DVD'}/)`);
       }
-      onProgress({ phase: 'ulcfg', pct: 100 });
 
       return { success: true, checksum: 'verified' };
     },
@@ -413,27 +447,155 @@ const App = (() => {
     state.processing = false;
     updateStats();
     log('info', 'Batch processing complete');
+    refreshDeviceGames(); // auto-refresh game list
   }
 
   // ── Device Detection ──
   async function refreshDevice() {
-    log('info', 'Detecting target device...');
+    log('info', 'Scanning for storage devices...');
+    const select = $('#device-select');
+
     try {
-      const dev = await Tauri.detectDevice();
-      state.device = dev;
-      const freeSpace = dev.free_space ?? dev.freeSpace ?? 0;
-      const totalSpace = dev.total_space ?? dev.totalSpace ?? 0;
-      const mode = dev.recommended_mode ?? dev.mode ?? 'auto';
-      const fs = typeof dev.filesystem === 'object' ? Object.keys(dev.filesystem)[0] : dev.filesystem;
-      $('#device-name').textContent = dev.name;
-      $('#device-fs').textContent = fs;
-      $('#device-space').textContent = totalSpace > 0 ? `${formatBytes(freeSpace)} / ${formatBytes(totalSpace)}` : 'N/A';
-      $('#device-mode').textContent = mode === 'split' ? 'Split (USBExtreme)' : 'No-split (Direct)';
-      log('success', `Device: ${dev.name} — ${fs}${freeSpace > 0 ? ' — ' + formatBytes(freeSpace) + ' free' : ''}`);
+      const devices = await Tauri.listDevices();
+      state.devices = devices;
+
+      // Populate dropdown
+      select.innerHTML = '';
+      if (devices.length === 0) {
+        select.innerHTML = '<option value="">No device detected</option>';
+        state.device = null;
+        updateDeviceDisplay(null);
+        log('warn', 'No removable devices found');
+        return;
+      }
+
+      devices.forEach((dev, idx) => {
+        const opt = document.createElement('option');
+        opt.value = idx;
+        const fs = typeof dev.filesystem === 'object' ? Object.keys(dev.filesystem)[0] : dev.filesystem;
+        opt.textContent = `${dev.name} (${fs})`;
+        select.appendChild(opt);
+      });
+
+      // Select first device
+      select.value = '0';
+      selectDevice(0);
+      log('success', `Found ${devices.length} device(s)`);
+
     } catch (e) {
-      log('error', 'Device detection failed: ' + e.message);
-      $('#device-name').textContent = 'Not selected';
+      log('error', 'Device scan failed: ' + e.message);
+      select.innerHTML = '<option value="">Detection failed</option>';
     }
+  }
+
+  function selectDevice(idx) {
+    const devices = state.devices || [];
+    const dev = devices[idx];
+    if (!dev) return;
+    state.device = dev;
+    updateDeviceDisplay(dev);
+  }
+
+  function updateDeviceDisplay(dev) {
+    const freeSpace = dev?.free_space ?? dev?.freeSpace ?? 0;
+    const totalSpace = dev?.total_space ?? dev?.totalSpace ?? 0;
+    const mode = dev?.recommended_mode ?? dev?.mode ?? 'auto';
+    const fs = dev ? (typeof dev.filesystem === 'object' ? Object.keys(dev.filesystem)[0] : dev.filesystem) : '—';
+
+    $('#device-fs').textContent = fs;
+    $('#device-space').textContent = totalSpace > 0 ? `${formatBytes(freeSpace)} / ${formatBytes(totalSpace)}` : 'N/A';
+    $('#device-mode').textContent = mode === 'split' ? 'Split (USBExtreme)' : 'No-split (Direct)';
+  }
+
+  // ── Device Games List ──
+  async function refreshDeviceGames() {
+    const container = $('#device-games-list');
+    const mountPoint = state.device?.mount_point;
+
+    if (!mountPoint) {
+      container.innerHTML = '<div style="text-align:center;color:var(--color-text-muted);font-size:var(--text-sm);padding:var(--space-4)">No device selected</div>';
+      return;
+    }
+
+    container.innerHTML = '<div style="text-align:center;color:var(--color-text-muted);font-size:var(--text-sm);padding:var(--space-4)">Scanning...</div>';
+
+    try {
+      let games;
+      if (invoke) {
+        games = await invoke('list_device_games', { destDir: mountPoint });
+      } else {
+        // Browser mode: scan destDirHandle
+        games = await scanBrowserGames();
+      }
+
+      if (!games || games.length === 0) {
+        container.innerHTML = '<div style="text-align:center;color:var(--color-text-muted);font-size:var(--text-sm);padding:var(--space-4)">No games found on device</div>';
+        return;
+      }
+
+      container.innerHTML = games.map(g => `
+        <div style="display:flex;align-items:center;gap:var(--space-3);padding:var(--space-2) 0;border-bottom:1px solid var(--color-border)">
+          <div style="width:28px;height:28px;border-radius:var(--radius-sm);display:flex;align-items:center;justify-content:center;font-size:var(--text-xs);flex-shrink:0;background:${g.mode === 'split' ? 'rgba(37,99,235,0.15);color:var(--color-primary)' : 'rgba(6,182,212,0.15);color:var(--neon-cyan)'}">
+            ${g.mode === 'split' ? 'S' : 'C'}
+          </div>
+          <div style="min-width:0;flex:1">
+            <div style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${g.game_id}">${g.game_id}</div>
+            <div style="font-size:10px;color:var(--color-text-muted)">${formatBytes(g.size)} · ${g.location}${g.parts > 1 ? ' · ' + g.parts + ' parts' : ''}</div>
+          </div>
+        </div>
+      `).join('');
+
+      log('info', `Found ${games.length} game(s) on device`);
+    } catch (e) {
+      container.innerHTML = `<div style="text-align:center;color:var(--color-error);font-size:var(--text-sm);padding:var(--space-4)">${e.message}</div>`;
+      log('error', 'Game scan failed: ' + e.message);
+    }
+  }
+
+  async function scanBrowserGames() {
+    if (!destDirHandle) return [];
+    const games = [];
+
+    // Scan ul.* files (split mode)
+    for await (const [name, handle] of destDirHandle.entries()) {
+      if (handle.kind === 'file' && name.startsWith('ul.') && name !== 'ul.cfg') {
+        const file = await handle.getFile();
+        const gameId = name.replace(/^ul\./, '').replace(/\.\d+$/, '');
+        if (file.size > 0) {
+          games.push({
+            game_id: gameId,
+            title: gameId,
+            parts: 1,
+            size: file.size,
+            location: 'root',
+            mode: 'split',
+          });
+        }
+      }
+    }
+
+    // Scan CD/ and DVD/ directories
+    for (const subdir of ['CD', 'DVD']) {
+      try {
+        const dirHandle = await destDirHandle.getDirectoryHandle(subdir);
+        for await (const [name, handle] of dirHandle.entries()) {
+          if (handle.kind === 'file' && name.endsWith('.iso')) {
+            const file = await handle.getFile();
+            const gameId = name.replace(/\.iso$/, '');
+            games.push({
+              game_id: gameId,
+              title: gameId,
+              parts: 1,
+              size: file.size,
+              location: subdir,
+              mode: 'nosplit',
+            });
+          }
+        }
+      } catch (e) { /* directory doesn't exist */ }
+    }
+
+    return games;
   }
 
   // ── Events ──
@@ -460,6 +622,17 @@ const App = (() => {
     });
     $('#btn-clear-log').addEventListener('click', () => { $('#log-viewer').innerHTML = ''; log('info', 'Log cleared'); });
     $('#btn-refresh-device').addEventListener('click', () => { destDirHandle = null; refreshDevice(); });
+
+    $('#device-select').addEventListener('change', (e) => {
+      const idx = parseInt(e.target.value);
+      if (!isNaN(idx)) {
+        selectDevice(idx);
+        const dev = state.devices?.[idx];
+        if (dev) log('info', `Selected: ${dev.name}`);
+      }
+    });
+
+    $('#btn-refresh-games').addEventListener('click', refreshDeviceGames);
 
     $('#btn-settings').addEventListener('click', () => $('#modal-settings').classList.add('modal-overlay--active'));
     $$('[data-close]').forEach(el => {
