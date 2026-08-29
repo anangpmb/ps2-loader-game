@@ -87,13 +87,21 @@ pub fn validate_iso(path: &Path) -> Result<IsoInfo, IsoError> {
     // PS2 SYSTEM.CNF typically contains: BOOT2 = cdrom0:\SLUS_XXX.XX;1
     let game_id = extract_game_id(&mut file).ok();
 
+    // Extract volume label from ISO9660 primary volume descriptor
+    // Volume label is at offset 0x8028 (40 bytes) from sector 16 start
+    let title = if format == "ISO9660" {
+        extract_volume_label(&mut file)
+    } else {
+        None
+    };
+
     Ok(IsoInfo {
         valid: true,
         size,
         format: Some(format),
         error: None,
         game_id,
-        title: None,
+        title,
     })
 }
 
@@ -129,6 +137,28 @@ fn extract_game_id(file: &mut File) -> Result<String, IsoError> {
     }
 
     Err(IsoError::InvalidFormat("SYSTEM.CNF not found".into()))
+}
+
+/// Extract volume label from ISO9660 primary volume descriptor.
+/// Volume label is at offset 0x40 (64 bytes) from the start of the PVD.
+/// PVD starts at sector 16 (offset 0x8000), so label is at 0x8040.
+/// Actually: PVD type (1 byte at 0x8000), then standard ID (5 bytes), version (1 byte),
+/// then volume flags (1 byte), then volume label at offset 0x8028 (40 bytes).
+fn extract_volume_label(file: &mut File) -> Option<String> {
+    // Read the volume label field (40 bytes at offset 0x8028)
+    let mut label = [0u8; 40];
+    file.seek(SeekFrom::Start(0x8028)).ok()?;
+    file.read_exact(&mut label).ok()?;
+
+    // The label may be space-padded and/or D-characters
+    let label_str = String::from_utf8_lossy(&label);
+    let trimmed = label_str.trim_end_matches(' ').trim_end_matches('\0');
+
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 #[cfg(test)]

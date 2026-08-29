@@ -22,6 +22,8 @@ fn main() {
             commands::generate_ulcfg,
             commands::verify_games,
             commands::list_device_games,
+            commands::delete_game,
+            commands::rename_game,
             commands::get_settings,
             commands::save_settings,
         ])

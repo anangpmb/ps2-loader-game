@@ -267,7 +267,7 @@ pub fn list_device_games(dest_dir: String) -> Result<Vec<GameEntry>, String> {
         }
     }
 
-    // 2. Scan CD/ and DVD/ for no-split ISOs
+    // 2. Scan CD/ and DVD/ for no-split ISOs — read title from ISO header
     for subdir in &["CD", "DVD"] {
         let dir = dest_path.join(subdir);
         if !dir.exists() { continue; }
@@ -277,10 +277,15 @@ pub fn list_device_games(dest_dir: String) -> Result<Vec<GameEntry>, String> {
                 if !name.ends_with(".iso") { continue; }
                 let game_id = name.strip_suffix(".iso").unwrap_or(&name).to_string();
                 if game_id.is_empty() { continue; }
+                let path = entry.path();
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+
+                // Read volume label from ISO header for real title
+                let title = read_iso_title(&path).unwrap_or_else(|| game_id.clone());
+
                 games.push(GameEntry {
-                    game_id: game_id.clone(),
-                    title: game_id,
+                    game_id,
+                    title,
                     parts: 1,
                     size,
                     location: subdir.to_string(),
@@ -312,6 +317,80 @@ pub fn list_device_games(dest_dir: String) -> Result<Vec<GameEntry>, String> {
     }
 
     Ok(games)
+}
+
+/// Read volume label from ISO9660 header.
+fn read_iso_title(path: &std::path::Path) -> Option<String> {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut file = File::open(path).ok()?;
+    let mut label = [0u8; 40];
+    file.seek(SeekFrom::Start(0x8028)).ok()?;
+    file.read_exact(&mut label).ok()?;
+    let label_str = String::from_utf8_lossy(&label);
+    let trimmed = label_str.trim_end_matches(' ').trim_end_matches('\0');
+    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+}
+
+/// Delete a game from the device.
+#[tauri::command]
+pub fn delete_game(dest_dir: String, game_id: String, mode: String, location: String) -> Result<(), String> {
+    let dest_path = PathBuf::from(&dest_dir);
+
+    if mode == "nosplit" {
+        // Delete ISO from CD/ or DVD/
+        let iso_path = dest_path.join(&location).join(format!("{}.iso", game_id));
+        std::fs::remove_file(&iso_path).map_err(|e| format!("Failed to delete {}: {}", iso_path.display(), e))?;
+    } else {
+        // Delete ul.xxx files and ul.cfg entry
+        for i in 0..100 {
+            let name = if i == 0 { format!("ul.{}", game_id) } else { format!("ul.{:02}", i) };
+            let path = dest_path.join(&name);
+            if path.exists() {
+                std::fs::remove_file(&path).map_err(|e| format!("Failed to delete {}: {}", name, e))?;
+            } else if i > 0 {
+                break; // no more parts
+            }
+        }
+        // Remove from ul.cfg
+        let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
+        if ulcfg_path.exists() {
+            ulcfg::remove_entry(&ulcfg_path, &game_id).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Rename a game title.
+#[tauri::command]
+pub fn rename_game(dest_dir: String, game_id: String, mode: String, location: String, new_title: String) -> Result<(), String> {
+    let dest_path = PathBuf::from(&dest_dir);
+
+    if mode == "nosplit" {
+        // Rename ISO file: old_id.iso → new_title.iso
+        let old_path = dest_path.join(&location).join(format!("{}.iso", game_id));
+        let new_path = dest_path.join(&location).join(format!("{}.iso", new_title));
+        if old_path.exists() {
+            std::fs::rename(&old_path, &new_path)
+                .map_err(|e| format!("Failed to rename: {}", e))?;
+        }
+    } else {
+        // Update title in ul.cfg
+        let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
+        if ulcfg_path.exists() {
+            let mut entries = ulcfg::parse_ulcfg(&ulcfg_path).map_err(|e| e.to_string())?;
+            for entry in &mut entries {
+                if entry.game_id == game_id {
+                    entry.title = new_title.clone();
+                }
+            }
+            ulcfg::write_ulcfg(&ulcfg_path, &entries).map_err(|e| e.to_string())?;
+        }
+    }
+
+    Ok(())
 }
 
 /// Get current app settings.

@@ -92,7 +92,7 @@ const App = (() => {
 
       const gameId = queueItem.gameId || queueItem.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_');
       const fileSize = queueItem.file.size;
-      const isSplit = item.mode === 'split';
+      const isSplit = queueItem.mode === 'split';
       const CHUNK_SIZE = 0xFFFF0000;
       const totalChunks = isSplit ? Math.ceil(fileSize / CHUNK_SIZE) : 1;
 
@@ -508,6 +508,8 @@ const App = (() => {
   }
 
   // ── Device Games List ──
+  let deviceGames = []; // cache for sort
+
   async function refreshDeviceGames() {
     const container = $('#device-games-list');
     const mountPoint = state.device?.mount_point;
@@ -520,35 +522,129 @@ const App = (() => {
     container.innerHTML = '<div style="text-align:center;color:var(--color-text-muted);font-size:var(--text-sm);padding:var(--space-4)">Scanning...</div>';
 
     try {
-      let games;
       if (invoke) {
-        games = await invoke('list_device_games', { destDir: mountPoint });
+        deviceGames = await invoke('list_device_games', { destDir: mountPoint });
       } else {
-        // Browser mode: scan destDirHandle
-        games = await scanBrowserGames();
+        deviceGames = await scanBrowserGames();
       }
-
-      if (!games || games.length === 0) {
-        container.innerHTML = '<div style="text-align:center;color:var(--color-text-muted);font-size:var(--text-sm);padding:var(--space-4)">No games found on device</div>';
-        return;
-      }
-
-      container.innerHTML = games.map(g => `
-        <div style="display:flex;align-items:center;gap:var(--space-3);padding:var(--space-2) 0;border-bottom:1px solid var(--color-border)">
-          <div style="width:28px;height:28px;border-radius:var(--radius-sm);display:flex;align-items:center;justify-content:center;font-size:var(--text-xs);flex-shrink:0;background:${g.mode === 'split' ? 'rgba(37,99,235,0.15);color:var(--color-primary)' : 'rgba(6,182,212,0.15);color:var(--neon-cyan)'}">
-            ${g.mode === 'split' ? 'S' : 'C'}
-          </div>
-          <div style="min-width:0;flex:1">
-            <div style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--color-text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis" title="${g.game_id}">${g.game_id}</div>
-            <div style="font-size:10px;color:var(--color-text-muted)">${formatBytes(g.size)} · ${g.location}${g.parts > 1 ? ' · ' + g.parts + ' parts' : ''}</div>
-          </div>
-        </div>
-      `).join('');
-
-      log('info', `Found ${games.length} game(s) on device`);
+      renderDeviceGames();
     } catch (e) {
       container.innerHTML = `<div style="text-align:center;color:var(--color-error);font-size:var(--text-sm);padding:var(--space-4)">${e.message}</div>`;
       log('error', 'Game scan failed: ' + e.message);
+    }
+  }
+
+  function renderDeviceGames() {
+    const container = $('#device-games-list');
+    const sortBy = $('#sort-games')?.value || 'name';
+    let games = [...deviceGames];
+
+    // Sort
+    games.sort((a, b) => {
+      switch (sortBy) {
+        case 'name': return a.title.localeCompare(b.title);
+        case 'name-desc': return b.title.localeCompare(a.title);
+        case 'size': return a.size - b.size;
+        case 'size-desc': return b.size - a.size;
+        default: return 0;
+      }
+    });
+
+    if (games.length === 0) {
+      container.innerHTML = '<div style="text-align:center;color:var(--color-text-muted);font-size:var(--text-sm);padding:var(--space-4)">No games found</div>';
+      return;
+    }
+
+    container.innerHTML = games.map(g => `
+      <div class="game-list-item" data-id="${g.game_id}">
+        <div class="game-list-item__badge game-list-item__badge--${g.mode}">
+          ${g.mode === 'split' ? 'S' : 'C'}
+        </div>
+        <div style="min-width:0;flex:1">
+          <div class="game-list-item__id" title="${g.title}">${g.title}</div>
+          <div class="game-list-item__meta">${g.game_id} · ${formatBytes(g.size)} · ${g.location}</div>
+        </div>
+        <div style="display:flex;gap:2px;flex-shrink:0">
+          <button class="btn btn--ghost btn--sm" style="padding:4px" onclick="App.renameGame('${g.game_id}','${g.mode}','${g.location}','${g.title.replace(/'/g, "\\'")}')" title="Rename">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
+          </button>
+          <button class="btn btn--ghost btn--sm" style="padding:4px;color:var(--color-error)" onclick="App.deleteGame('${g.game_id}','${g.mode}','${g.location}','${g.title.replace(/'/g, "\\'")}')" title="Delete">
+            <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+          </button>
+        </div>
+      </div>
+    `).join('');
+
+    log('info', `Found ${games.length} game(s) on device`);
+  }
+
+  async function deleteGame(gameId, mode, location, title) {
+    if (!confirm(`Delete "${title}" (${gameId})?`)) return;
+    try {
+      if (invoke) {
+        await invoke('delete_game', { destDir: state.device.mount_point, gameId, mode, location });
+      } else {
+        // Browser mode
+        if (mode === 'nosplit') {
+          const dir = await destDirHandle.getDirectoryHandle(location, { create: false });
+          await dir.removeEntry(`${gameId}.iso`);
+        } else {
+          for (const name of await destDirHandle.keys()) {
+            if (name === `ul.${gameId}` || name.startsWith(`ul.${gameId}.`)) {
+              await destDirHandle.removeEntry(name);
+            }
+          }
+        }
+      }
+      toast('success', `Deleted: ${title}`);
+      log('info', `Deleted: ${title} (${gameId})`);
+      refreshDeviceGames();
+    } catch (e) {
+      toast('error', `Delete failed: ${e.message}`);
+      log('error', `Delete failed: ${e.message}`);
+    }
+  }
+
+  async function renameGame(gameId, mode, location, oldTitle) {
+    const newTitle = prompt(`Rename "${oldTitle}" to:`, oldTitle);
+    if (!newTitle || newTitle === oldTitle) return;
+    try {
+      if (invoke) {
+        await invoke('rename_game', { destDir: state.device.mount_point, gameId, mode, location, newTitle });
+      } else {
+        if (mode === 'nosplit') {
+          const dir = await destDirHandle.getDirectoryHandle(location, { create: false });
+          const oldHandle = await dir.getFileHandle(`${gameId}.iso`);
+          const newHandle = await dir.getFileHandle(`${newTitle}.iso`, { create: true });
+          const writable = await newHandle.createWritable();
+          const file = await oldHandle.getFile();
+          await writable.write(file);
+          await writable.close();
+          await dir.removeEntry(`${gameId}.iso`);
+        } else {
+          // Update ul.cfg title
+          try {
+            const handle = await destDirHandle.getFileHandle('ul.cfg');
+            const file = await handle.getFile();
+            let content = await file.text();
+            const lines = content.split('\n').map(line => {
+              if (line.startsWith(`${gameId}\t`)) {
+                return `${gameId}\t${newTitle}\t${line.split('\t')[2] || '1'}`;
+              }
+              return line;
+            });
+            const w = await handle.createWritable();
+            await w.write(lines.join('\n'));
+            await w.close();
+          } catch (e) {}
+        }
+      }
+      toast('success', `Renamed to: ${newTitle}`);
+      log('info', `Renamed: ${oldTitle} → ${newTitle}`);
+      refreshDeviceGames();
+    } catch (e) {
+      toast('error', `Rename failed: ${e.message}`);
+      log('error', `Rename failed: ${e.message}`);
     }
   }
 
@@ -633,6 +729,7 @@ const App = (() => {
     });
 
     $('#btn-refresh-games').addEventListener('click', refreshDeviceGames);
+    $('#sort-games').addEventListener('change', renderDeviceGames);
 
     $('#btn-settings').addEventListener('click', () => $('#modal-settings').classList.add('modal-overlay--active'));
     $$('[data-close]').forEach(el => {
@@ -673,7 +770,7 @@ const App = (() => {
     log('info', isTauri ? 'Running in Tauri mode (native)' : 'Running in browser mode (select folder when processing)');
   }
 
-  return { init };
+  return { init, deleteGame, renameGame };
 })();
 
 document.addEventListener('DOMContentLoaded', App.init);

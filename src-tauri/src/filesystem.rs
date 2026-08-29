@@ -118,21 +118,7 @@ pub fn get_device_info(mount_point: &Path) -> Result<DeviceInfo, FsError> {
 
 #[cfg(target_os = "macos")]
 fn detect_devices_macos() -> Result<Vec<DeviceInfo>, FsError> {
-    use std::process::Command;
-
-    let output = Command::new("diskutil")
-        .args(["list", "-plist", "external"])
-        .output()
-        .map_err(|e| FsError::DetectionFailed(e.to_string()))?;
-
-    if !output.status.success() {
-        return Err(FsError::DetectionFailed(
-            String::from_utf8_lossy(&output.stderr).to_string(),
-        ));
-    }
-
-    // Parse diskutil output to find mount points
-    // For simplicity, check /Volumes/ for external drives
+    // Scan /Volumes/ and check each for "Removable Media" via diskutil
     let mut devices = Vec::new();
     let volumes_dir = Path::new("/Volumes");
 
@@ -141,14 +127,31 @@ fn detect_devices_macos() -> Result<Vec<DeviceInfo>, FsError> {
             let entry = entry?;
             let path = entry.path();
             if path.is_dir() {
-                if let Ok(info) = get_device_info_macos(&path) {
-                    devices.push(info);
+                // Check if this is a removable device
+                if is_removable_macos(&path) {
+                    if let Ok(info) = get_device_info_macos(&path) {
+                        devices.push(info);
+                    }
                 }
             }
         }
     }
 
     Ok(devices)
+}
+
+/// Check if a macOS volume is removable using diskutil.
+fn is_removable_macos(mount_point: &Path) -> bool {
+    use std::process::Command;
+    let output = Command::new("diskutil")
+        .args(["info", mount_point.to_str().unwrap_or("")])
+        .output();
+    if let Ok(out) = output {
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // Check for "Device Media Type: Removable Media" or "Protocol: USB"
+        return stdout.contains("Removable Media") || stdout.contains("Protocol:                 USB");
+    }
+    false
 }
 
 #[cfg(target_os = "macos")]
@@ -379,14 +382,25 @@ fn get_space_info(path: &Path) -> (u64, u64) {
         use std::ffi::CString;
         use std::mem;
 
+        // Ensure path exists and is a directory
+        if !path.exists() || !path.is_dir() {
+            return (0, 0);
+        }
+
         unsafe {
             let path_c = CString::new(path.to_string_lossy().as_bytes()).unwrap();
             let mut stat: libc::statvfs = mem::zeroed();
-            if libc::statvfs(path_c.as_ptr(), &mut stat) == 0 {
+            if libc::statvfs(path_c.as_ptr(), &mut stat) == 0 && stat.f_frsize > 0 {
                 let free = stat.f_bavail as u64 * stat.f_frsize as u64;
                 let total = stat.f_blocks as u64 * stat.f_frsize as u64;
-                return (free, total);
+                if total > 0 {
+                    return (free, total);
+                }
             }
+        }
+        // Fallback: try parent directory
+        if let Some(parent) = path.parent() {
+            return get_space_info(parent);
         }
         (0, 0)
     }
