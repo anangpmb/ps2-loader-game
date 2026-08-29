@@ -34,12 +34,12 @@ jobs:
       - name: Build ARM64
         run: npx tauri build --target aarch64-apple-darwin
         env:
-          APPLE_SIGNING_IDENTITY: ""
+          APPLE_SIGNING_IDENTITY: "-"
 
       - name: Build Intel
         run: npx tauri build --target x86_64-apple-darwin
         env:
-          APPLE_SIGNING_IDENTITY: ""
+          APPLE_SIGNING_IDENTITY: "-"
 
       - name: Upload macOS ARM DMG
         uses: actions/upload-artifact@v4
