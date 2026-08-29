@@ -10,4 +10,4 @@ cargo:PERMISSION_FILES_PATH=/Users/user/Public/Project/Desktop/ps2-loader-game/s
 cargo:rerun-if-changed=capabilities
 cargo:rerun-if-env-changed=REMOVE_UNUSED_COMMANDS
 cargo:rustc-env=TAURI_ENV_TARGET_TRIPLE=aarch64-apple-darwin
-cargo:rustc-env=MACOSX_DEPLOYMENT_TARGET=10.13
+cargo:rustc-env=MACOSX_DEPLOYMENT_TARGET=10.15
