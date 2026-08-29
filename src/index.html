@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PS2 Backup Tool</title>
+  <link rel="stylesheet" href="styles/tokens.css">
+  <link rel="stylesheet" href="styles/main.css">
+</head>
+<body>
+  <div class="app" id="app">
+
+    <!-- Header -->
+    <header class="header">
+      <div class="header__logo">
+        <div class="header__icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/>
+            <polyline points="3.27 6.96 12 12.01 20.73 6.96"/>
+            <line x1="12" y1="22.08" x2="12" y2="12"/>
+          </svg>
+        </div>
+        <div>
+          <div class="header__title">PS2 BACKUP TOOL</div>
+          <div class="header__subtitle">OPL Manager + USBUtil — ISO to USBExtreme</div>
+        </div>
+      </div>
+      <div class="header__actions">
+        <button class="btn btn--ghost btn--sm" id="btn-settings" title="Settings">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
+          Settings
+        </button>
+        <button class="btn btn--ghost btn--sm" id="btn-about" title="About">
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+          About
+        </button>
+      </div>
+    </header>
+
+    <!-- Main Content -->
+    <main class="main">
+      <div class="main__content">
+
+        <!-- Stats -->
+        <div class="stats animate-in">
+          <div class="stat">
+            <div class="stat__value" id="stat-total">0</div>
+            <div class="stat__label">Total</div>
+          </div>
+          <div class="stat">
+            <div class="stat__value" id="stat-done">0</div>
+            <div class="stat__label">Done</div>
+          </div>
+          <div class="stat">
+            <div class="stat__value" id="stat-processing">0</div>
+            <div class="stat__label">Active</div>
+          </div>
+          <div class="stat">
+            <div class="stat__value" id="stat-errors">0</div>
+            <div class="stat__label">Errors</div>
+          </div>
+        </div>
+
+        <!-- Drop Zone -->
+        <div class="card animate-in" style="animation-delay: 50ms">
+          <div class="card__body" style="padding: 0;">
+            <div class="dropzone" id="dropzone">
+              <div class="dropzone__icon">
+                <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/>
+                  <polyline points="17 8 12 3 7 8"/>
+                  <line x1="12" y1="3" x2="12" y2="15"/>
+                </svg>
+              </div>
+              <div class="dropzone__text">
+                Drop <strong>PS2 ISO</strong> files here
+              </div>
+              <div class="dropzone__hint">
+                or click to browse — supports .iso, .bin/.cue
+              </div>
+              <input type="file" id="file-input" accept=".iso,.bin,.cue" multiple hidden>
+            </div>
+          </div>
+        </div>
+
+        <!-- Queue -->
+        <div class="card animate-in" style="animation-delay: 100ms">
+          <div class="card__header">
+            <div class="card__title">Processing Queue</div>
+            <div style="display:flex;gap:var(--space-2)">
+              <button class="btn btn--primary btn--sm" id="btn-start" disabled>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+                Start
+              </button>
+              <button class="btn btn--ghost btn--sm" id="btn-clear" disabled>Clear</button>
+            </div>
+          </div>
+          <div class="card__body">
+            <div class="queue" id="queue">
+              <div class="queue__empty">
+                <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1" style="opacity:0.3;margin-bottom:var(--space-2)"><rect x="2" y="2" width="20" height="20" rx="2"/><line x1="8" y1="6" x2="16" y2="6"/><line x1="8" y1="10" x2="16" y2="10"/><line x1="8" y1="14" x2="12" y2="14"/></svg>
+                <div>No games in queue</div>
+                <div style="font-size:var(--text-xs);margin-top:4px;color:var(--color-text-muted)">ISO files will appear here</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Log Viewer -->
+        <div class="card animate-in" style="animation-delay: 150ms">
+          <div class="card__header">
+            <div class="card__title">Process Log</div>
+            <button class="btn btn--ghost btn--sm" id="btn-clear-log">Clear</button>
+          </div>
+          <div class="card__body" style="padding: 0;">
+            <div class="log-viewer" id="log-viewer">
+              <div class="log-entry">
+                <span class="log-entry__time">--:--:--</span>
+                <span class="log-entry__level log-entry__level--info">INFO</span>
+                <span class="log-entry__msg">PS2 Backup Tool initialized. Ready to process ISO files.</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Sidebar -->
+      <div class="main__sidebar">
+
+        <!-- Target Device -->
+        <div class="card animate-in" style="animation-delay: 200ms">
+          <div class="card__header">
+            <div class="card__title">Target Device</div>
+            <button class="btn btn--ghost btn--sm" id="btn-refresh-device">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
+              Refresh
+            </button>
+          </div>
+          <div class="card__body">
+            <div class="device-info" id="device-info">
+              <div class="device-info__item">
+                <div class="device-info__icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="4" width="20" height="16" rx="2"/><line x1="2" y1="10" x2="22" y2="10"/></svg>
+                </div>
+                <div>
+                  <div class="device-info__label">Device</div>
+                  <div class="device-info__value" id="device-name">No device detected</div>
+                </div>
+              </div>
+              <div class="device-info__item">
+                <div class="device-info__icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12H2"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
+                </div>
+                <div>
+                  <div class="device-info__label">Filesystem</div>
+                  <div class="device-info__value" id="device-fs">—</div>
+                </div>
+              </div>
+              <div class="device-info__item">
+                <div class="device-info__icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/></svg>
+                </div>
+                <div>
+                  <div class="device-info__label">Free Space</div>
+                  <div class="device-info__value" id="device-space">—</div>
+                </div>
+              </div>
+              <div class="device-info__item">
+                <div class="device-info__icon">
+                  <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                </div>
+                <div>
+                  <div class="device-info__label">Mode</div>
+                  <div class="device-info__value" id="device-mode">Auto-detect</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Current Operation -->
+        <div class="card animate-in" style="animation-delay: 250ms">
+          <div class="card__header">
+            <div class="card__title">Current Operation</div>
+            <span class="badge badge--info" id="op-badge">IDLE</span>
+          </div>
+          <div class="card__body">
+            <div id="op-details" style="color:var(--color-text-muted);font-size:var(--text-sm);text-align:center;padding:var(--space-4)">
+              No operation in progress
+            </div>
+            <div class="progress" id="op-progress" style="display:none">
+              <div class="progress__bar">
+                <div class="progress__fill" id="op-progress-fill" style="width:0%"></div>
+              </div>
+              <div class="progress__detail">
+                <span id="op-progress-label">Preparing...</span>
+                <span id="op-progress-pct">0%</span>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Quick Actions -->
+        <div class="card animate-in" style="animation-delay: 300ms">
+          <div class="card__header">
+            <div class="card__title">Quick Actions</div>
+          </div>
+          <div class="card__body" style="display:flex;flex-direction:column;gap:var(--space-2)">
+            <button class="btn btn--sm" style="width:100%;justify-content:center" id="btn-browse-device">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              Browse Device Contents
+            </button>
+            <button class="btn btn--sm" style="width:100%;justify-content:center" id="btn-generate-ulcfg">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+              Regenerate ul.cfg
+            </button>
+            <button class="btn btn--sm" style="width:100%;justify-content:center" id="btn-verify">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+              Verify Existing Games
+            </button>
+          </div>
+        </div>
+      </div>
+    </main>
+
+    <!-- Footer -->
+    <footer style="text-align:center;padding:var(--space-4);color:var(--color-text-muted);font-size:var(--text-xs);border-top:1px solid var(--color-border)">
+      PS2 Backup Tool v0.1.0 — Built for OPL + USBExtreme format
+    </footer>
+  </div>
+
+  <!-- Settings Modal -->
+  <div class="modal-overlay" id="modal-settings">
+    <div class="modal">
+      <div class="modal__header">
+        <div class="modal__title">SETTINGS</div>
+        <button class="modal__close" data-close="modal-settings">&times;</button>
+      </div>
+      <div class="modal__body">
+        <div style="display:flex;flex-direction:column;gap:var(--space-4)">
+          <div>
+            <label style="font-size:var(--text-sm);color:var(--color-text-secondary);display:block;margin-bottom:var(--space-2)">Buffer Size (MB)</label>
+            <select id="setting-buffer" style="width:100%;padding:var(--space-2) var(--space-3);background:var(--color-bg-surface);border:1px solid var(--color-border);border-radius:var(--radius-md);color:var(--color-text-primary);font-family:var(--font-mono);font-size:var(--text-sm)">
+              <option value="4">4 MB (Safe)</option>
+              <option value="8" selected>8 MB (Default)</option>
+              <option value="16">16 MB (Fast)</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:var(--text-sm);color:var(--color-text-secondary);display:block;margin-bottom:var(--space-2)">Checksum Algorithm</label>
+            <select id="setting-checksum" style="width:100%;padding:var(--space-2) var(--space-3);background:var(--color-bg-surface);border:1px solid var(--color-border);border-radius:var(--radius-md);color:var(--color-text-primary);font-family:var(--font-mono);font-size:var(--text-sm)">
+              <option value="crc32" selected>CRC32 (Fast)</option>
+              <option value="xxhash">xxHash (Balanced)</option>
+              <option value="sha256">SHA-256 (Secure)</option>
+            </select>
+          </div>
+          <div>
+            <label style="font-size:var(--text-sm);color:var(--color-text-secondary);display:block;margin-bottom:var(--space-2)">Max Retries per Chunk</label>
+            <input type="number" id="setting-retries" value="3" min="1" max="10" style="width:100%;padding:var(--space-2) var(--space-3);background:var(--color-bg-surface);border:1px solid var(--color-border);border-radius:var(--radius-md);color:var(--color-text-primary);font-family:var(--font-mono);font-size:var(--text-sm)">
+          </div>
+          <div>
+            <label style="font-size:var(--text-sm);color:var(--color-text-secondary);display:block;margin-bottom:var(--space-2)">Split Mode Override</label>
+            <select id="setting-split-mode" style="width:100%;padding:var(--space-2) var(--space-3);background:var(--color-bg-surface);border:1px solid var(--color-border);border-radius:var(--radius-md);color:var(--color-text-primary);font-family:var(--font-mono);font-size:var(--text-sm)">
+              <option value="auto" selected>Auto-detect (Recommended)</option>
+              <option value="split">Force Split (FAT32)</option>
+              <option value="nosplit">Force No-Split (NTFS/exFAT)</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <div class="modal__footer">
+        <button class="btn btn--ghost btn--sm" data-close="modal-settings">Cancel</button>
+        <button class="btn btn--primary btn--sm" id="btn-save-settings">Save</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Toast Container -->
+  <div class="toast-container" id="toast-container"></div>
+
+  <script src="app.js"></script>
+</body>
+</html>

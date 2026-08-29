@@ -1,0 +1,10 @@
+/Users/user/Public/Project/Desktop/ps2-loader-game/src-tauri/target/debug/deps/xxhash_rust-531be82682c24b8f.d: /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/lib.rs /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/utils.rs /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh32_common.rs /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh64_common.rs /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3_common.rs /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3.rs
+
+/Users/user/Public/Project/Desktop/ps2-loader-game/src-tauri/target/debug/deps/libxxhash_rust-531be82682c24b8f.rmeta: /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/lib.rs /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/utils.rs /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh32_common.rs /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh64_common.rs /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3_common.rs /Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3.rs
+
+/Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/lib.rs:
+/Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/utils.rs:
+/Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh32_common.rs:
+/Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh64_common.rs:
+/Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3_common.rs:
+/Users/user/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/xxhash-rust-0.8.18/src/xxh3.rs:

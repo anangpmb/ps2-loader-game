@@ -1,0 +1,14 @@
+{
+  "name": "ps2-backup-tool",
+  "version": "0.1.0",
+  "private": true,
+  "description": "PS2 Backup & Loader Tool — ISO to USBExtreme for OPL",
+  "scripts": {
+    "dev": "echo 'Open src/index.html in browser for standalone mode. Use `cargo tauri dev` for full app.'",
+    "tauri": "tauri",
+    "build": "tauri build"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.11.4"
+  }
+}
