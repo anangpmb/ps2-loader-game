@@ -24,6 +24,7 @@ fn main() {
             commands::list_device_games,
             commands::delete_game,
             commands::rename_game,
+            commands::repair_split_files,
             commands::get_settings,
             commands::save_settings,
         ])

@@ -400,6 +400,100 @@ pub fn rename_game(dest_dir: String, game_id: String, mode: String, location: St
     Ok(())
 }
 
+/// Repair old-format split files (ul.00, ul.01) to USBExtreme format (ul.<game_id>, ul.<game_id>.01).
+#[tauri::command]
+pub fn repair_split_files(dest_dir: String) -> Result<u32, String> {
+    let dest_path = PathBuf::from(&dest_dir);
+    let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
+    if !ulcfg_path.exists() {
+        return Ok(0);
+    }
+
+    let entries = ulcfg::parse_ulcfg(&ulcfg_path).map_err(|e| e.to_string())?;
+    let mut repaired = 0u32;
+
+    for entry in &entries {
+        if entry.parts <= 1 {
+            // Single-part game: just need ul.<game_id>
+            let correct_name = format!("ul.{}", entry.game_id);
+            let correct_path = dest_path.join(&correct_name);
+            if !correct_path.exists() {
+                // Look for old-format single file
+                if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
+                    for dir_entry in read_dir.flatten() {
+                        let name = dir_entry.file_name().to_string_lossy().to_string();
+                        if name.starts_with("ul.") && name != "ul.cfg" && name != correct_name {
+                            // Check if this could be the old file for this game
+                            // Old single-part: ul.<something> where something is not a numbered part
+                            let suffix = name.strip_prefix("ul.").unwrap_or("");
+                            if !suffix.contains('.') && suffix == entry.game_id {
+                                // Already correct, skip
+                            } else if !suffix.starts_with(|c: char| c.is_ascii_digit()) {
+                                // Not a numbered part, might be a different game
+                            }
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+
+        // Multi-part game: check if correct files exist
+        let first_correct = format!("ul.{}", entry.game_id);
+        let first_correct_path = dest_path.join(&first_correct);
+
+        if first_correct_path.exists() {
+            // Check if part 1 exists with correct name
+            let part1_correct = format!("ul.{}.{:02}", entry.game_id, 1);
+            if dest_path.join(&part1_correct).exists() {
+                continue; // Already correct
+            }
+        }
+
+        // Correct files don't exist — look for old-format files
+        // Old format: ul.00, ul.01, ul.02, ... (indexed by position, not game_id)
+        // We need to find consecutive numbered files that belong to this game
+        let mut old_files: Vec<(u32, std::path::PathBuf)> = Vec::new();
+        if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
+            for dir_entry in read_dir.flatten() {
+                let name = dir_entry.file_name().to_string_lossy().to_string();
+                if let Some(rest) = name.strip_prefix("ul.") {
+                    if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
+                        if let Ok(idx) = rest.parse::<u32>() {
+                            old_files.push((idx, dir_entry.path()));
+                        }
+                    }
+                }
+            }
+        }
+
+        if old_files.is_empty() {
+            continue;
+        }
+
+        old_files.sort_by_key(|(idx, _)| *idx);
+        let total_parts = old_files.len().min(entry.parts as usize);
+
+        for i in 0..total_parts {
+            let old_path = &old_files[i as usize].1;
+            let new_name = if i == 0 {
+                format!("ul.{}", entry.game_id)
+            } else {
+                format!("ul.{}.{:02}", entry.game_id, i)
+            };
+            let new_path = dest_path.join(&new_name);
+
+            if old_path != &new_path && !new_path.exists() {
+                std::fs::rename(old_path, &new_path)
+                    .map_err(|e| format!("Failed to rename {}: {}", old_path.display(), e))?;
+                repaired += 1;
+            }
+        }
+    }
+
+    Ok(repaired)
+}
+
 /// Get current app settings.
 #[tauri::command]
 pub fn get_settings(state: State<AppState>) -> Result<AppSettings, String> {

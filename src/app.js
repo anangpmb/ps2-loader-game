@@ -523,6 +523,8 @@ const App = (() => {
 
     try {
       if (invoke) {
+        const repaired = await invoke('repair_split_files', { destDir: mountPoint });
+        if (repaired > 0) log('info', `Repaired ${repaired} old-format split file(s)`);
         deviceGames = await invoke('list_device_games', { destDir: mountPoint });
       } else {
         deviceGames = await scanBrowserGames();
