@@ -131,19 +131,41 @@ const App = (() => {
     return entries;
   }
   async function readUlcfgEntries() {
-    const targets = ['ul.cfg', 'ul.cfg.bak'];
-    for (const name of targets) {
+    // Get file handles directly from entries() to bypass getFileHandle issues
+    const fileHandles = {};
+    for await (const [name, handle] of destDirHandle.entries()) {
+      if (handle.kind === 'file') fileHandles[name] = handle;
+    }
+    
+    const hasUlcfg = 'ul.cfg' in fileHandles;
+    const hasUlcfgBak = 'ul.cfg.bak' in fileHandles;
+    log('info', `Files found: ${Object.keys(fileHandles).length}, ul.cfg: ${hasUlcfg}, ul.cfg.bak: ${hasUlcfgBak}`);
+    
+    // Try ul.cfg first
+    if (hasUlcfg) {
       try {
-        log('info', `Trying to read: "${name}"`);
-        const handle = await destDirHandle.getFileHandle(name);
-        const file = await handle.getFile();
+        const file = await fileHandles['ul.cfg'].getFile();
         const bytes = new Uint8Array(await file.arrayBuffer());
-        log('info', `${name} loaded: ${bytes.length} bytes`);
+        log('info', `ul.cfg loaded: ${bytes.length} bytes, ${Math.floor(bytes.length / 64)} records`);
         return parseUlcfg(bytes);
       } catch (e) {
-        log('warn', `Read "${name}" failed: ${e.name}: ${e.message}`);
+        log('error', `Read ul.cfg failed: ${e.name}: ${e.message}`);
       }
     }
+    
+    // Try ul.cfg.bak as fallback
+    if (hasUlcfgBak) {
+      try {
+        const file = await fileHandles['ul.cfg.bak'].getFile();
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        log('info', `ul.cfg.bak loaded: ${bytes.length} bytes, ${Math.floor(bytes.length / 64)} records`);
+        return parseUlcfg(bytes);
+      } catch (e) {
+        log('error', `Read ul.cfg.bak failed: ${e.name}: ${e.message}`);
+      }
+    }
+    
+    log('warn', 'No ul.cfg found on drive');
     return [];
   }
   async function writeUlcfgEntries(entries) {
@@ -151,22 +173,33 @@ const App = (() => {
     const data = encodeUlcfg(entries);
     log('info', `Writing ul.cfg: ${entries.length} entries, ${data.length} bytes`);
 
-    const targets = ['ul.cfg', 'ul.cfg.bak'];
-    for (const name of targets) {
-      try {
-        log('info', `Trying to write: "${name}"`);
-        const handle = await destDirHandle.getFileHandle(name, { create: true });
-        const w = await handle.createWritable();
-        await w.write(data);
-        await w.close();
-        log('info', `${name} successfully updated: ${entries.length} entries`);
-        return;
-      } catch (e) {
-        log('error', `Write to "${name}" failed: ${e.name}: ${e.message}`);
+    // Try to remove existing ul.cfg using entries() handle
+    try {
+      for await (const [name, handle] of destDirHandle.entries()) {
+        if (name === 'ul.cfg' && handle.kind === 'file') {
+          await destDirHandle.removeEntry('ul.cfg');
+          log('info', 'Removed old ul.cfg');
+          break;
+        }
       }
+    } catch (e) {
+      log('info', `Remove ul.cfg: ${e.name} (may be locked)`);
     }
 
-    throw new Error('Failed to write ul.cfg. Check drive permissions or write-protection switch.');
+    // Create new ul.cfg
+    try {
+      const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
+      const w = await handle.createWritable();
+      await w.write(data);
+      await w.close();
+      log('info', `ul.cfg written: ${entries.length} entries`);
+      return;
+    } catch (e) {
+      log('error', `Write "ul.cfg" failed: ${e.name}: ${e.message}`);
+      log('error', 'File may be read-only. Try: attrib -r -h -s E:\\ul.cfg');
+    }
+
+    throw new Error('Failed to write ul.cfg. Check file attributes.');
   }
 
   const Tauri = {
@@ -371,8 +404,14 @@ const App = (() => {
         }
         // Preserve existing title if available, otherwise use gameId
         const existing = existingMap.get(p.gameId);
-        const title = existing ? existing.title : p.gameId;
+        let title = existing ? existing.title : p.gameId;
         const media = existing ? existing.media : 0x14;
+        
+        // Detect if title is actually a gameId (fallback placeholder)
+        const isGameId = /^[A-Z]{2,4}[_-]\d{3}\.\d{2}$/.test(title);
+        if (isGameId) {
+          log('warn', `Title "${title}" looks like gameId, keeping as-is (manual rename needed)`);
+        }
         entries.push({ title, gameId: p.gameId, parts, media });
         log('info', `Found: ${title} (${p.gameId}) - ${parts} parts`);
       }
