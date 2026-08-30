@@ -127,10 +127,10 @@ const App = (() => {
       for await (const [name] of destDirHandle.entries()) {
         files.push(name);
       }
-      console.log('[ul.cfg] files in', destDirHandle.name, ':', files);
+      console.log('[ul.cfg] files in', destDirHandle.name, ':', files.length, 'total');
       
-      // Check if ul.cfg exists (case-insensitive)
-      const ulcfgFile = files.find(f => f.toLowerCase() === 'ul.cfg');
+      // Check for ul.cfg or ul.cfg.bak
+      const ulcfgFile = files.find(f => f.toLowerCase() === 'ul.cfg' || f.toLowerCase() === 'ul.cfg.bak');
       if (!ulcfgFile) {
         console.log('[ul.cfg] file not found');
         return [];
