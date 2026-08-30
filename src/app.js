@@ -22,6 +22,7 @@ const App = (() => {
   // True when running in a browser that lacks the File System Access API
   // (macOS Safari, Firefox) — drive writing is impossible there.
   const fsUnsupported = !isTauri && typeof window.showDirectoryPicker !== 'function';
+  console.log(`[PS2BT] Mode: ${isTauri ? 'Tauri' : 'Browser'}, invoke: ${!!invoke}`);
 
   // ── OPL USBExtreme format helpers (browser mode) ──
   // Mirror of the Rust backend (opl_crc.rs / ulcfg.rs / split.rs) so drives
@@ -110,33 +111,50 @@ const App = (() => {
   }
   function parseUlcfg(bytes) {
     const entries = [];
-    for (let off = 0; off + UL_ENTRY_SIZE <= bytes.length; off += UL_ENTRY_SIZE) {
+    // Detect 64-byte header: if first record has no printable ASCII in name area, skip it
+    let startOff = 0;
+    if (bytes.length >= UL_ENTRY_SIZE * 2) {
+      let hasPrintable = false;
+      for (let i = 0; i < 32; i++) {
+        if (bytes[i] >= 32 && bytes[i] <= 126) { hasPrintable = true; break; }
+      }
+      if (!hasPrintable) startOff = UL_ENTRY_SIZE;
+    }
+    for (let off = startOff; off + UL_ENTRY_SIZE <= bytes.length; off += UL_ENTRY_SIZE) {
       const title = ulReadAscii(bytes, off, 32);
       const image = ulReadAscii(bytes, off + 0x20, 15);
       const gameId = image.startsWith('ul.') ? image.slice(3) : image;
       const parts = bytes[off + 0x2F];
       const media = bytes[off + 0x30];
-      if (title !== "UNKNOWN_GAME") entries.push({ title, gameId, parts, media });
+      if (title !== "UNKNOWN_GAME") {
+        // If title looks like a gameId (e.g., SLUS_200.00), use gameId as title
+        const isGameId = /^[A-Z]{2,4}[_-]\d{3}\.\d{2}$/.test(title);
+        entries.push({ title: isGameId ? gameId : title, gameId, parts, media });
+      }
     }
     return entries;
   }
   async function readUlcfgEntries() {
     try {
-      // List all files in directory for debugging
-      const files = [];
-      for await (const [name] of destDirHandle.entries()) {
-        files.push(name);
+      // List all files under 100KB (likely config files, not game chunks)
+      const smallFiles = [];
+      for await (const [name, handle] of destDirHandle.entries()) {
+        if (handle.kind !== 'file') continue;
+        const file = await handle.getFile();
+        if (file.size < 102400) { // under 100KB
+          smallFiles.push({ name, size: file.size });
+        }
       }
-      console.log('[ul.cfg] files in', destDirHandle.name, ':', files.length, 'total');
+      console.log('[ul.cfg] files under 100KB:', smallFiles);
       
-      // Check for ul.cfg or ul.cfg.bak
-      const ulcfgFile = files.find(f => f.toLowerCase() === 'ul.cfg' || f.toLowerCase() === 'ul.cfg.bak');
-      if (!ulcfgFile) {
-        console.log('[ul.cfg] file not found');
+      // Find ul.cfg or ul.cfg.bak
+      const ulcfgEntry = smallFiles.find(f => f.name.toLowerCase() === 'ul.cfg' || f.name.toLowerCase() === 'ul.cfg.bak');
+      if (!ulcfgEntry) {
+        console.log('[ul.cfg] not found in small files');
         return [];
       }
-      console.log('[ul.cfg] found:', ulcfgFile);
-      const handle = await destDirHandle.getFileHandle(ulcfgFile);
+      console.log('[ul.cfg] found:', ulcfgEntry);
+      const handle = await destDirHandle.getFileHandle(ulcfgEntry.name);
       const file = await handle.getFile();
       const bytes = new Uint8Array(await file.arrayBuffer());
       console.log('[ul.cfg] file size:', bytes.length, 'bytes');
@@ -154,6 +172,13 @@ const App = (() => {
     const data = encodeUlcfg(entries);
     log('info', `Writing ul.cfg: ${entries.length} entries, ${data.length} bytes to "${destDirHandle.name}"`);
     
+    // Log sample entries for debugging
+    const sample = entries.slice(0, 5);
+    for (const e of sample) {
+      log('info', `  → title="${e.title}" gameId="${e.gameId}" parts=${e.parts}`);
+    }
+    if (entries.length > 5) log('info', `  ... and ${entries.length - 5} more`);
+    
     // Test if we can create any file
     try {
       const testHandle = await destDirHandle.getFileHandle('_test_write', { create: true });
@@ -170,8 +195,6 @@ const App = (() => {
     
     // Try writing to ul.cfg
     try {
-      // Delete existing file first (in case it's locked or read-only)
-      try { await destDirHandle.removeEntry('ul.cfg'); } catch {}
       const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
       const w = await handle.createWritable();
       await w.write(data);
@@ -186,7 +209,6 @@ const App = (() => {
     const fallbackNames = ['ul.cfg.bak', '_ulcfg', 'ulcfg.dat'];
     for (const name of fallbackNames) {
       try {
-        try { await destDirHandle.removeEntry(name); } catch {}
         const handle = await destDirHandle.getFileHandle(name, { create: true });
         const w = await handle.createWritable();
         await w.write(data);
@@ -369,6 +391,7 @@ const App = (() => {
       let entries = await readUlcfgEntries();
       entries = entries.filter(e => e.gameId !== gameId);
       entries.push({ title, gameId, parts: totalChunks, media });
+      log('info', `Adding to ul.cfg: title="${title}" gameId="${gameId}" parts=${totalChunks}`);
       await writeUlcfgEntries(entries);
       onProgress({ phase: 'ulcfg', pct: 100 });
 
@@ -383,6 +406,11 @@ const App = (() => {
       // Browser mode: rebuild ul.cfg from chunk files on disk
       if (!destDirHandle) throw new Error('No destination folder selected');
       log('info', `Scanning "${destDirHandle.name}" for chunk files...`);
+      
+      // Read existing titles from ul.cfg (source of truth for names)
+      const existingEntries = await readUlcfgEntries();
+      const existingMap = new Map(existingEntries.map(e => [e.gameId, e]));
+      
       const entries = [];
       const seen = new Set();
       for await (const [name, handle] of destDirHandle.entries()) {
@@ -395,8 +423,12 @@ const App = (() => {
         for await (const [n2, h2] of destDirHandle.entries()) {
           if (h2.kind === 'file' && parseChunkName(n2)?.gameId === p.gameId) parts++;
         }
-        entries.push({ title: p.gameId, gameId: p.gameId, parts, media: 0x14 });
-        log('info', `Found: ${p.gameId} (${parts} parts)`);
+        // Preserve existing title if available, otherwise use gameId
+        const existing = existingMap.get(p.gameId);
+        const title = existing ? existing.title : p.gameId;
+        const media = existing ? existing.media : 0x14;
+        entries.push({ title, gameId: p.gameId, parts, media });
+        log('info', `Found: ${title} (${p.gameId}) - ${parts} parts`);
       }
       log('info', `Found ${entries.length} games, writing ul.cfg...`);
       await writeUlcfgEntries(entries);
