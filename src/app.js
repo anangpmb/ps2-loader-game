@@ -122,16 +122,21 @@ const App = (() => {
   }
   async function readUlcfgEntries() {
     try {
-      // Check if ul.cfg exists first
-      let hasUlcfg = false;
+      // List all files in directory for debugging
+      const files = [];
       for await (const [name] of destDirHandle.entries()) {
-        if (name === 'ul.cfg') { hasUlcfg = true; break; }
+        files.push(name);
       }
-      if (!hasUlcfg) {
-        console.log('[ul.cfg] file not found in', destDirHandle.name);
+      console.log('[ul.cfg] files in', destDirHandle.name, ':', files);
+      
+      // Check if ul.cfg exists (case-insensitive)
+      const ulcfgFile = files.find(f => f.toLowerCase() === 'ul.cfg');
+      if (!ulcfgFile) {
+        console.log('[ul.cfg] file not found');
         return [];
       }
-      const handle = await destDirHandle.getFileHandle('ul.cfg');
+      console.log('[ul.cfg] found:', ulcfgFile);
+      const handle = await destDirHandle.getFileHandle(ulcfgFile);
       const file = await handle.getFile();
       const bytes = new Uint8Array(await file.arrayBuffer());
       console.log('[ul.cfg] file size:', bytes.length, 'bytes');
