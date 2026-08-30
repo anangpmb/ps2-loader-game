@@ -127,22 +127,27 @@
       <!-- Sidebar -->
       <div class="main__sidebar">
 
-        <!-- Target Device -->
-        <div class="card animate-in" style="animation-delay: 200ms">
+        <!-- Target Device (Step 1 — required before processing) -->
+        <div class="card card--target target-device--empty animate-in" id="card-target" style="animation-delay: 200ms">
           <div class="card__header">
-            <div class="card__title">Target Device</div>
-            <button class="btn btn--ghost btn--sm" id="btn-refresh-device">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-              Refresh
-            </button>
+            <div class="card__title" style="display:flex;align-items:center;gap:var(--space-2)">
+              <span class="step-badge">1</span>
+              Target Device
+            </div>
+            <span class="badge badge--info" id="device-status">Required</span>
           </div>
           <div class="card__body">
+            <button class="btn btn--primary" id="btn-refresh-device" style="width:100%;justify-content:center;margin-bottom:var(--space-3)">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+              Select Drive
+            </button>
             <div style="margin-bottom:var(--space-3)">
-              <select id="device-select" style="width:100%;padding:var(--space-2) var(--space-3);background:var(--color-bg-surface);border:1px solid var(--color-border);border-radius:var(--radius-md);color:var(--color-text-primary);font-family:var(--font-mono);font-size:var(--text-sm)">
-                <option value="">No device detected</option>
+              <select id="device-select" aria-label="Target drive" style="width:100%;padding:var(--space-2) var(--space-3);background:var(--color-bg-surface);border:1px solid var(--color-border);border-radius:var(--radius-md);color:var(--color-text-primary);font-family:var(--font-mono);font-size:var(--text-sm)">
+                <option value="">No drive selected</option>
               </select>
             </div>
             <div class="device-info" id="device-info">
+              <div class="device-info__item">
                 <div class="device-info__icon">
                   <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12H2"/><path d="M5.45 5.11L2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/></svg>
                 </div>

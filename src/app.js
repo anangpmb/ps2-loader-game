@@ -19,28 +19,148 @@ const App = (() => {
   const isTauri = typeof window.__TAURI__ !== 'undefined';
   const invoke = isTauri ? window.__TAURI__.core.invoke : null;
   let destDirHandle = null;
+  // True when running in a browser that lacks the File System Access API
+  // (macOS Safari, Firefox) — drive writing is impossible there.
+  const fsUnsupported = !isTauri && typeof window.showDirectoryPicker !== 'function';
+
+  // ── OPL USBExtreme format helpers (browser mode) ──
+  // Mirror of the Rust backend (opl_crc.rs / ulcfg.rs / split.rs) so drives
+  // written in browser mode use the real, PS2-bootable format.
+  const UL_ENTRY_SIZE = 64;
+
+  // OPL's non-standard CRC32 of the game name — port of src-tauri/src/opl_crc.rs.
+  const Opl = (() => {
+    let tab = null;
+    function buildTable() {
+      const t = new Uint32Array(256);
+      for (let table = 0; table < 256; table++) {
+        let crc = (table << 24) | 0; // int32
+        for (let i = 0; i < 8; i++) {
+          if (crc < 0) crc = (crc << 1) | 0;              // MSB set
+          else crc = ((crc << 1) ^ 0x04C11DB7) | 0;
+        }
+        t[255 - table] = crc >>> 0;
+      }
+      return t;
+    }
+    function crc32(name) {
+      if (!tab) tab = buildTable();
+      const buf = new Uint8Array(33);
+      const n = Math.min(name.length, 32);
+      for (let i = 0; i < n; i++) buf[i] = name.charCodeAt(i) & 0xFF;
+      let crc = 0; // int32
+      let count = 0;
+      do {
+        const b = buf[count++];
+        const idx = (b ^ ((crc >> 24) & 0xFF)) & 0xFF;
+        crc = (tab[idx] ^ (((crc << 8) >>> 0) & 0xFFFFFF00)) | 0;
+      } while (buf[count - 1] !== 0 && count <= 32);
+      return crc >>> 0;
+    }
+    function hex(name) {
+      return crc32(name).toString(16).toUpperCase().padStart(8, '0');
+    }
+    return { crc32, hex };
+  })();
+
+  function chunkName(crcHex, gameId, part) {
+    return `ul.${crcHex}.${gameId}.${part.toString(16).toUpperCase().padStart(2, '0')}`;
+  }
+
+  // Parse `ul.<crc>.<gameId>.<part>` (gameId itself may contain dots).
+  function parseChunkName(name) {
+    if (name === 'ul.cfg' || !name.startsWith('ul.')) return null;
+    const tokens = name.slice(3).split('.');
+    if (tokens.length < 3) return null;
+    const crc = tokens[0];
+    const part = tokens[tokens.length - 1];
+    const gameId = tokens.slice(1, -1).join('.');
+    if (!crc || !gameId) return null;
+    return { crc, gameId, part };
+  }
+
+  function mediaForSize(size) { return size <= 700 * 1024 * 1024 ? 0x12 : 0x14; }
+
+  // ── Binary ul.cfg (64-byte records) ──
+  function ulWriteAscii(buf, off, str, maxLen) {
+    const n = Math.min(str.length, maxLen);
+    for (let i = 0; i < n; i++) buf[off + i] = str.charCodeAt(i) & 0xFF;
+  }
+  function ulReadAscii(bytes, off, len) {
+    let end = off;
+    const max = Math.min(off + len, bytes.length);
+    while (end < max && bytes[end] !== 0) end++;
+    return new TextDecoder('ascii').decode(bytes.slice(off, end)).replace(/ +$/, '');
+  }
+  function encodeUlcfg(entries) {
+    const buf = new Uint8Array(entries.length * UL_ENTRY_SIZE);
+    entries.forEach((e, i) => {
+      const off = i * UL_ENTRY_SIZE;
+      ulWriteAscii(buf, off, e.title, 31);
+      ulWriteAscii(buf, off + 0x20, 'ul.' + e.gameId, 14);
+      buf[off + 0x2F] = Math.min(e.parts || 1, 255) & 0xFF;
+      buf[off + 0x30] = e.media === 0x12 ? 0x12 : 0x14;
+      buf[off + 0x35] = 0x08; // magic
+    });
+    return buf;
+  }
+  function parseUlcfg(bytes) {
+    const entries = [];
+    for (let off = 0; off + UL_ENTRY_SIZE <= bytes.length; off += UL_ENTRY_SIZE) {
+      const title = ulReadAscii(bytes, off, 32);
+      const image = ulReadAscii(bytes, off + 0x20, 15);
+      const gameId = image.startsWith('ul.') ? image.slice(3) : image;
+      const parts = bytes[off + 0x2F];
+      const media = bytes[off + 0x30];
+      if (title) entries.push({ title, gameId, parts, media });
+    }
+    return entries;
+  }
+  async function readUlcfgEntries() {
+    try {
+      const handle = await destDirHandle.getFileHandle('ul.cfg');
+      const bytes = new Uint8Array(await (await handle.getFile()).arrayBuffer());
+      return parseUlcfg(bytes);
+    } catch (e) { return []; }
+  }
+  async function writeUlcfgEntries(entries) {
+    const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
+    const w = await handle.createWritable();
+    await w.write(encodeUlcfg(entries));
+    await w.close();
+  }
 
   const Tauri = {
-    async listDevices() {
+    async listDevices({ interactive = false } = {}) {
       if (invoke) {
         return invoke('list_devices');
       }
-      // Browser: prompt for folder, return as single device
-      if (!destDirHandle) {
-        try {
-          destDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
-        } catch (e) {
-          return [];
-        }
-      }
-      return destDirHandle ? [{
+      // Browser mode: a "device" is a folder the user grants access to.
+      const asDevice = () => (destDirHandle ? [{
         name: destDirHandle.name,
         filesystem: 'Browser FS',
         free_space: 0,
         total_space: 0,
         recommended_mode: 'nosplit',
         mount_point: destDirHandle.name,
-      }] : [];
+      }] : []);
+
+      if (destDirHandle) return asDevice();
+
+      // Only open the OS folder picker in response to a user gesture. On page
+      // load (interactive=false) we stay quiet instead of throwing.
+      if (!interactive) return [];
+
+      if (typeof window.showDirectoryPicker !== 'function') {
+        throw new Error("This browser can't write to a drive (no File System Access API). On macOS Safari or Firefox, use Chrome/Edge — or the desktop app.");
+      }
+      try {
+        destDirHandle = await window.showDirectoryPicker({ mode: 'readwrite' });
+      } catch (e) {
+        if (e && e.name === 'AbortError') return []; // user cancelled — not an error
+        throw e;
+      }
+      return asDevice();
     },
 
     async detectDevice() {
@@ -90,34 +210,50 @@ const App = (() => {
       if (!destDirHandle) throw new Error('No destination folder. Click "Refresh" to select one.');
       if (!queueItem.file) throw new Error('No file data. Re-drop the ISO.');
 
-      const gameId = queueItem.gameId || queueItem.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_');
+      const title = queueItem.name.replace(/\.[^.]+$/, '');
+      // gameId keeps dots (e.g. SLUS_217.46) but strips other unsafe chars.
+      const gameId = queueItem.gameId || title.replace(/[^a-zA-Z0-9_.]/g, '_');
       const fileSize = queueItem.file.size;
       const isSplit = queueItem.mode === 'split';
-      const CHUNK_SIZE = 0xFFFF0000;
-      const totalChunks = isSplit ? Math.ceil(fileSize / CHUNK_SIZE) : 1;
+      const CHUNK_SIZE = 1073741824; // 1 GiB — matches OPL / backend
+      const media = mediaForSize(fileSize);
+      const crcHex = Opl.hex(title);
 
-      // Determine target directory
-      let targetDir = destDirHandle;
       if (!isSplit) {
-        // OPL convention: CD for small games, DVD for large ones
+        // No-split: copy the whole ISO into CD/ or DVD/ (OPL scans those dirs).
         const subdir = fileSize < 4_700_000_000 ? 'CD' : 'DVD';
-        targetDir = await destDirHandle.getDirectoryHandle(subdir, { create: true });
+        const targetDir = await destDirHandle.getDirectoryHandle(subdir, { create: true });
         log('info', `No-split mode: writing to ${subdir}/ directory`);
+        const fileHandle = await targetDir.getFileHandle(`${gameId}.iso`, { create: true });
+        const writable = await fileHandle.createWritable();
+        const reader = queueItem.file.stream().getReader();
+        let written = 0;
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await writable.write(value);
+          written += value.byteLength;
+          onProgress({
+            phase: 'copy', chunk: 1, totalChunks: 1,
+            pct: Math.min(Math.round((written / fileSize) * 100), 99),
+            speed: (written / 1024 / 1024).toFixed(1) + ' MB',
+          });
+        }
+        await writable.close();
+        onProgress({ phase: 'verify', pct: 100 });
+        log('info', 'No-split mode: ul.cfg not needed (ISO in CD/DVD directory)');
+        return { success: true, checksum: 'verified' };
       }
 
+      // Split mode: write `ul.<crc>.<gameId>.<part>` 1 GiB chunks.
+      const totalChunks = Math.ceil(fileSize / CHUNK_SIZE) || 1;
       for (let i = 0; i < totalChunks; i++) {
-        let fileName;
-        if (isSplit) {
-          fileName = totalChunks === 1 ? `ul.${gameId}` : `ul.${String(i).padStart(2, '0')}`;
-        } else {
-          fileName = `${gameId}.iso`;
-        }
-
+        const fileName = chunkName(crcHex, gameId, i);
         const chunkStart = i * CHUNK_SIZE;
         const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, fileSize);
         const chunkBlob = queueItem.file.slice(chunkStart, chunkEnd);
 
-        const fileHandle = await targetDir.getFileHandle(fileName, { create: true });
+        const fileHandle = await destDirHandle.getFileHandle(fileName, { create: true });
         const writable = await fileHandle.createWritable();
         const reader = chunkBlob.stream().getReader();
         let written = 0;
@@ -137,50 +273,26 @@ const App = (() => {
           });
         }
         await writable.close();
-        onProgress({
-          phase: 'copy',
-          chunk: i + 1,
-          totalChunks,
-          pct: Math.round(((i + 1) / totalChunks) * 100),
-          speed: 'Done',
-        });
       }
 
-      // Verify
+      // Verify first chunk exists and is non-empty.
       onProgress({ phase: 'verify', pct: 0 });
-      const verifyName = isSplit
-        ? (totalChunks === 1 ? `ul.${gameId}` : 'ul.00')
-        : `${gameId}.iso`;
-      const verifyDir = isSplit ? destDirHandle : targetDir;
-      const verifyHandle = await verifyDir.getFileHandle(verifyName);
+      const verifyHandle = await destDirHandle.getFileHandle(chunkName(crcHex, gameId, 0));
       const verifyFile = await verifyHandle.getFile();
       if (verifyFile.size === 0) throw new Error('Verification failed: written file is empty');
       onProgress({ phase: 'verify', pct: 100 });
 
-      // ul.cfg only for split mode
-      if (isSplit) {
-        onProgress({ phase: 'ulcfg', pct: 0 });
-        try {
-          let ulcfgContent = '';
-          try {
-            const existing = await destDirHandle.getFileHandle('ul.cfg');
-            ulcfgContent = await (await existing.getFile()).text();
-          } catch (e) {}
-          const title = queueItem.name.replace(/\.[^.]+$/, '');
-          const lines = ulcfgContent.split('\n').filter(l => l && !l.startsWith(gameId + '\t'));
-          lines.push(`${gameId}\t${title}\t${totalChunks}`);
-          const ulcfgHandle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
-          const w = await ulcfgHandle.createWritable();
-          await w.write(lines.join('\n'));
-          await w.close();
-        } catch (e) {
-          log('warn', `ul.cfg write failed: ${e.message}`);
-        }
-        onProgress({ phase: 'ulcfg', pct: 100 });
-      } else {
-        onProgress({ phase: 'ulcfg', pct: 100 });
-        log('info', `No-split mode: ul.cfg not needed (file in ${fileSize < 4_700_000_000 ? 'CD' : 'DVD'}/)`);
+      // Update binary ul.cfg (real 64-byte format).
+      onProgress({ phase: 'ulcfg', pct: 0 });
+      try {
+        let entries = await readUlcfgEntries();
+        entries = entries.filter(e => e.gameId !== gameId);
+        entries.push({ title, gameId, parts: totalChunks, media });
+        await writeUlcfgEntries(entries);
+      } catch (e) {
+        log('warn', `ul.cfg write failed: ${e.message}`);
       }
+      onProgress({ phase: 'ulcfg', pct: 100 });
 
       return { success: true, checksum: 'verified' };
     },
@@ -251,7 +363,16 @@ const App = (() => {
     $('#stat-done').textContent = q.filter(i => i.status === 'done').length;
     $('#stat-processing').textContent = q.filter(i => i.status === 'processing').length;
     $('#stat-errors').textContent = q.filter(i => i.status === 'error').length;
-    $('#btn-start').disabled = !q.some(i => i.status === 'pending') || state.processing;
+
+    const hasDevice = !!state.device;
+    const hasPending = q.some(i => i.status === 'pending');
+    const startBtn = $('#btn-start');
+    startBtn.disabled = !hasPending || state.processing || !hasDevice;
+    // Explain why Start is unavailable so the prerequisite is discoverable.
+    startBtn.title = !hasDevice
+      ? 'Select a target drive first (Step 1)'
+      : (!hasPending ? 'Add ISO files to the queue' : '');
+
     $('#btn-clear').disabled = q.length === 0 || state.processing;
   }
 
@@ -451,21 +572,22 @@ const App = (() => {
   }
 
   // ── Device Detection ──
-  async function refreshDevice() {
-    log('info', 'Scanning for storage devices...');
+  async function refreshDevice(interactive = false) {
+    log('info', interactive ? 'Selecting target drive...' : 'Scanning for storage devices...');
     const select = $('#device-select');
 
     try {
-      const devices = await Tauri.listDevices();
+      const devices = await Tauri.listDevices({ interactive });
       state.devices = devices;
 
       // Populate dropdown
       select.innerHTML = '';
       if (devices.length === 0) {
-        select.innerHTML = '<option value="">No device detected</option>';
+        select.innerHTML = '<option value="">No drive selected</option>';
         state.device = null;
         updateDeviceDisplay(null);
-        log('warn', 'No removable devices found');
+        refreshDeviceGames();
+        log('warn', 'No target drive available');
         return;
       }
 
@@ -485,6 +607,7 @@ const App = (() => {
     } catch (e) {
       log('error', 'Device scan failed: ' + e.message);
       select.innerHTML = '<option value="">Detection failed</option>';
+      if (interactive) toast('error', e.message);
     }
   }
 
@@ -494,6 +617,7 @@ const App = (() => {
     if (!dev) return;
     state.device = dev;
     updateDeviceDisplay(dev);
+    refreshDeviceGames(); // auto-scan games for the newly selected drive
   }
 
   function updateDeviceDisplay(dev) {
@@ -505,6 +629,23 @@ const App = (() => {
     $('#device-fs').textContent = fs;
     $('#device-space').textContent = totalSpace > 0 ? `${formatBytes(freeSpace)} / ${formatBytes(totalSpace)}` : 'N/A';
     $('#device-mode').textContent = mode === 'split' ? 'Split (USBExtreme)' : 'No-split (Direct)';
+
+    // Prominence state: draw attention while empty, confirm once a drive is set.
+    const card = $('#card-target');
+    const status = $('#device-status');
+    const selectBtn = $('#btn-refresh-device');
+    if (dev) {
+      card?.classList.remove('target-device--empty');
+      card?.classList.add('target-device--ready');
+      if (status) { status.className = 'badge badge--success'; status.textContent = 'Ready'; }
+      selectBtn?.classList.remove('btn--primary');
+    } else {
+      card?.classList.add('target-device--empty');
+      card?.classList.remove('target-device--ready');
+      if (status) { status.className = 'badge badge--info'; status.textContent = 'Required'; }
+      if (!fsUnsupported) selectBtn?.classList.add('btn--primary');
+    }
+    updateStats(); // Start button depends on having a target drive
   }
 
   // ── Device Games List ──
@@ -591,11 +732,15 @@ const App = (() => {
           const dir = await destDirHandle.getDirectoryHandle(location, { create: false });
           await dir.removeEntry(`${gameId}.iso`);
         } else {
+          // Remove every chunk file for this game id, then drop the ul.cfg entry.
+          const toRemove = [];
           for await (const name of destDirHandle.keys()) {
-            if (name === `ul.${gameId}` || name.startsWith(`ul.${gameId}.`)) {
-              await destDirHandle.removeEntry(name);
-            }
+            const p = parseChunkName(name);
+            if (p && p.gameId === gameId) toRemove.push(name);
           }
+          for (const name of toRemove) await destDirHandle.removeEntry(name);
+          const entries = (await readUlcfgEntries()).filter(e => e.gameId !== gameId);
+          await writeUlcfgEntries(entries);
         }
       }
       toast('success', `Deleted: ${title}`);
@@ -624,21 +769,27 @@ const App = (() => {
           await writable.close();
           await dir.removeEntry(`${gameId}.iso`);
         } else {
-          // Update ul.cfg title
-          try {
-            const handle = await destDirHandle.getFileHandle('ul.cfg');
-            const file = await handle.getFile();
-            let content = await file.text();
-            const lines = content.split('\n').map(line => {
-              if (line.startsWith(`${gameId}\t`)) {
-                return `${gameId}\t${newTitle}\t${line.split('\t')[2] || '1'}`;
-              }
-              return line;
-            });
-            const w = await handle.createWritable();
-            await w.write(lines.join('\n'));
-            await w.close();
-          } catch (e) {}
+          // Title change ⇒ CRC change: rename every chunk file, then update ul.cfg.
+          const newCrc = Opl.hex(newTitle);
+          const renames = [];
+          for await (const [name, handle] of destDirHandle.entries()) {
+            if (handle.kind !== 'file') continue;
+            const p = parseChunkName(name);
+            if (p && p.gameId === gameId && p.crc !== newCrc) {
+              renames.push([name, `ul.${newCrc}.${p.gameId}.${p.part}`]);
+            }
+          }
+          for (const [oldName, newName] of renames) {
+            const oldHandle = await destDirHandle.getFileHandle(oldName);
+            const newHandle = await destDirHandle.getFileHandle(newName, { create: true });
+            const writable = await newHandle.createWritable();
+            await writable.write(await oldHandle.getFile());
+            await writable.close();
+            await destDirHandle.removeEntry(oldName);
+          }
+          const entries = await readUlcfgEntries();
+          for (const e of entries) if (e.gameId === gameId) e.title = newTitle;
+          await writeUlcfgEntries(entries);
         }
       }
       toast('success', `Renamed to: ${newTitle}`);
@@ -653,23 +804,38 @@ const App = (() => {
   async function scanBrowserGames() {
     if (!destDirHandle) return [];
     const games = [];
+    const known = new Set();
 
-    // Scan ul.* files (split mode)
+    // Sum chunk file sizes/parts grouped by game id.
+    const chunkGroups = {}; // gameId -> { size, parts }
     for await (const [name, handle] of destDirHandle.entries()) {
-      if (handle.kind === 'file' && name.startsWith('ul.') && name !== 'ul.cfg') {
-        const file = await handle.getFile();
-        const gameId = name.replace(/^ul\./, '').replace(/\.\d+$/, '');
-        if (file.size > 0) {
-          games.push({
-            game_id: gameId,
-            title: gameId,
-            parts: 1,
-            size: file.size,
-            location: 'root',
-            mode: 'split',
-          });
-        }
-      }
+      if (handle.kind !== 'file') continue;
+      const p = parseChunkName(name);
+      if (!p) continue;
+      const file = await handle.getFile();
+      const g = chunkGroups[p.gameId] || { size: 0, parts: 0 };
+      g.size += file.size;
+      g.parts += 1;
+      chunkGroups[p.gameId] = g;
+    }
+
+    // Split games from ul.cfg (grouped, real titles).
+    for (const e of await readUlcfgEntries()) {
+      const g = chunkGroups[e.gameId] || { size: 0, parts: e.parts };
+      games.push({
+        game_id: e.gameId, title: e.title, parts: e.parts,
+        size: g.size, location: 'root', mode: 'split',
+      });
+      known.add(e.gameId);
+    }
+
+    // Orphan chunk groups not listed in ul.cfg.
+    for (const [gameId, g] of Object.entries(chunkGroups)) {
+      if (known.has(gameId)) continue;
+      games.push({
+        game_id: gameId, title: gameId, parts: g.parts,
+        size: g.size, location: 'root', mode: 'split',
+      });
     }
 
     // Scan CD/ and DVD/ directories
@@ -719,7 +885,7 @@ const App = (() => {
       log('info', 'Queue cleared');
     });
     $('#btn-clear-log').addEventListener('click', () => { $('#log-viewer').innerHTML = ''; log('info', 'Log cleared'); });
-    $('#btn-refresh-device').addEventListener('click', () => { destDirHandle = null; refreshDevice(); });
+    $('#btn-refresh-device').addEventListener('click', () => { destDirHandle = null; refreshDevice(true); });
 
     $('#device-select').addEventListener('change', (e) => {
       const idx = parseInt(e.target.value);
@@ -767,9 +933,66 @@ const App = (() => {
 
   function init() {
     bindEvents();
+
+    // The device button differs per mode: native rescans connected drives,
+    // browser opens a folder picker. Label/icon reflect that.
+    const deviceBtn = $('#btn-refresh-device');
+    if (deviceBtn) {
+      deviceBtn.title = isTauri
+        ? 'Rescan connected drives'
+        : 'Choose the USB drive / folder to write games to';
+      if (isTauri) {
+        deviceBtn.innerHTML =
+          '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Refresh';
+      }
+    }
+
+    // Browser mode without the File System Access API (macOS Safari, Firefox)
+    // cannot write to a drive at all — surface a persistent, actionable notice
+    // instead of a button that silently does nothing.
+    if (fsUnsupported) {
+      showBrowserSupportNote(deviceBtn);
+    }
+
     refreshDevice();
     log('info', 'PS2 Backup Tool v0.1.0 ready');
-    log('info', isTauri ? 'Running in Tauri mode (native)' : 'Running in browser mode (select folder when processing)');
+    if (isTauri) {
+      log('info', 'Running in Tauri mode (native)');
+    } else if (fsUnsupported) {
+      log('warn', 'This browser lacks the File System Access API — use Chrome/Edge or the desktop app to write to a drive');
+    } else {
+      log('info', 'Running in browser mode — click "Select Drive" to grant folder access');
+    }
+  }
+
+  // Inline notice shown when the browser can't open/write a drive folder.
+  function showBrowserSupportNote(deviceBtn) {
+    const body = deviceBtn?.closest('.card__body');
+    if (!body || $('#browser-support-note')) return;
+
+    let appLink = '';
+    if (location.hostname.endsWith('github.io')) {
+      const owner = location.hostname.split('.')[0];
+      const repo = location.pathname.split('/').filter(Boolean)[0];
+      if (owner && repo) {
+        appLink = ` <a href="https://github.com/${owner}/${repo}/releases" target="_blank" rel="noopener">Get the desktop app →</a>`;
+      }
+    }
+
+    const note = document.createElement('div');
+    note.className = 'support-note';
+    note.id = 'browser-support-note';
+    note.innerHTML =
+      '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></svg>' +
+      '<span>This browser can’t write to a drive. Open in <strong>Chrome</strong> or <strong>Edge</strong>, or use the desktop app.' + appLink + '</span>';
+    body.insertBefore(note, body.firstChild);
+
+    // The pick action is impossible here — disable it; the notice explains why.
+    if (deviceBtn) {
+      deviceBtn.classList.remove('btn--primary');
+      deviceBtn.disabled = true;
+      deviceBtn.title = 'Not available in this browser — use Chrome/Edge or the desktop app';
+    }
   }
 
   return { init, deleteGame, renameGame };

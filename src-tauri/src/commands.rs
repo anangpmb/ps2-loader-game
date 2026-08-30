@@ -1,10 +1,12 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use tauri::State;
 
 use crate::filesystem::{self, DeviceInfo};
 use crate::iso::{self, IsoInfo};
+use crate::opl_crc;
 use crate::split::{self, ChecksumAlgo, SplitConfig, SplitResult};
 use crate::ulcfg::{self, UlEntry};
 
@@ -49,6 +51,51 @@ impl AppSettings {
     }
 }
 
+/// Heuristic media type for the `ul.cfg` entry: CD for small (<= 700 MiB)
+/// images, DVD otherwise. The exact disc type is not always recoverable from an
+/// ISO, and this matches how the vast majority of PS2 titles are distributed.
+fn detect_media(size: u64) -> u8 {
+    if size <= 700 * 1024 * 1024 {
+        ulcfg::MEDIA_CD
+    } else {
+        ulcfg::MEDIA_DVD
+    }
+}
+
+/// Sum the on-disk sizes of a split game's chunk files.
+fn sum_chunk_sizes(dest: &std::path::Path, crc_hex: &str, game_id: &str, parts: u16) -> u64 {
+    let mut total = 0u64;
+    for i in 0..parts.max(1) as u32 {
+        let name = split::chunk_file_name(crc_hex, game_id, i);
+        if let Ok(m) = std::fs::metadata(dest.join(name)) {
+            total += m.len();
+        }
+    }
+    total
+}
+
+/// Parse a USBExtreme chunk filename `ul.<crc>.<game_id>.<part>` into its parts.
+///
+/// The game id itself contains a `.` (e.g. `SLUS_217.46`), so the crc is the
+/// first token, the part is the last token, and everything in between is the id.
+fn parse_chunk_name(name: &str) -> Option<(String, String, String)> {
+    if name == "ul.cfg" {
+        return None;
+    }
+    let rest = name.strip_prefix("ul.")?;
+    let tokens: Vec<&str> = rest.split('.').collect();
+    if tokens.len() < 3 {
+        return None;
+    }
+    let crc = tokens[0].to_string();
+    let part = tokens[tokens.len() - 1].to_string();
+    let game_id = tokens[1..tokens.len() - 1].join(".");
+    if crc.is_empty() || game_id.is_empty() {
+        return None;
+    }
+    Some((crc, game_id, part))
+}
+
 /// Detect connected removable storage device (first one).
 #[tauri::command]
 pub fn detect_device() -> Result<DeviceInfo, String> {
@@ -89,6 +136,10 @@ pub async fn process_iso(
     // Create destination directory if it doesn't exist
     std::fs::create_dir_all(&dest_path).map_err(|e| format!("Cannot create dest dir: {}", e))?;
 
+    let file_size = std::fs::metadata(&source_path)
+        .map(|m| m.len())
+        .unwrap_or(0);
+
     // Determine mode
     let use_split = match split_mode.as_str() {
         "split" => true,
@@ -102,38 +153,47 @@ pub async fn process_iso(
         }
     };
 
+    // Resolve the display title and the real startup id (used for naming).
+    // The title's CRC drives the chunk filenames, so it must be finalized here.
+    let title = read_iso_title(&source_path).unwrap_or_else(|| {
+        ulcfg::extract_title(
+            source_path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+                .as_str(),
+        )
+    });
+    // Prefer the ISO's own startup id (e.g. "SLUS_217.46") over the frontend's.
+    let game_id = iso::extract_startup(&source_path).unwrap_or(game_id);
+    let crc_hex = opl_crc::crc32_hex(&title);
+
     // Run in a blocking thread to not freeze the UI
     let source_clone = source_path.clone();
     let game_id_clone = game_id.clone();
+    let crc_clone = crc_hex.clone();
     let dest_clone = dest_path.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         if use_split {
-            split::split_iso(&source_clone, &dest_clone, &game_id_clone, &config, |_progress| {})
+            split::split_iso(&source_clone, &dest_clone, &crc_clone, &game_id_clone, &config, |_p| {})
         } else {
-            split::copy_iso_nosplit(&source_clone, &dest_clone, &game_id_clone, &config, |_progress| {})
+            split::copy_iso_nosplit(&source_clone, &dest_clone, &game_id_clone, &config, |_p| {})
         }
     })
     .await
     .map_err(|e| format!("Task failed: {}", e))?
     .map_err(|e| e.to_string())?;
 
-    // Update ul.cfg only for split mode (USBExtreme format)
-    // No-split mode uses CD/DVD directories — OPL scans those directly
+    // Update ul.cfg only for split mode (USBExtreme format).
+    // No-split mode uses CD/DVD directories — OPL scans those directly.
     if use_split {
-        let ulcfg_path = ulcfg::ulcfg_path(&PathBuf::from(&dest_dir));
-        let title = read_iso_title(&source_path)
-            .unwrap_or_else(|| ulcfg::extract_title(
-                source_path
-                    .file_name()
-                    .map(|n| n.to_string_lossy().to_string())
-                    .unwrap_or_default()
-                    .as_str(),
-            ));
+        let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
         let entry = UlEntry {
             title,
             game_id,
             parts: result.chunks.len() as u16,
+            media: detect_media(file_size),
             mount_point: dest_dir,
         };
         ulcfg::add_entry(&ulcfg_path, &entry).map_err(|e| e.to_string())?;
@@ -142,63 +202,68 @@ pub async fn process_iso(
     Ok(result)
 }
 
-/// Generate or regenerate ul.cfg for a device.
+/// Regenerate `ul.cfg` for a device from the split chunk files on disk.
+///
+/// Note: OPL locates chunk files by recomputing the CRC of the `ul.cfg` name
+/// field, so an entry is only valid when its name hashes back to the CRC baked
+/// into the filenames. That original name cannot be recovered from a CRC, so an
+/// existing `ul.cfg` is treated as the source of truth for titles; groups on
+/// disk with no matching entry are added with the game id as a placeholder title
+/// (their filenames keep whatever CRC they already have).
 #[tauri::command]
 pub fn generate_ulcfg(dest_dir: String) -> Result<usize, String> {
     let dest_path = PathBuf::from(&dest_dir);
     let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
 
-    // Scan for existing ul.* files and build entries
-    let mut entries = Vec::new();
+    // Existing titles keyed by game id (source of truth for names).
+    let existing: BTreeMap<String, UlEntry> = ulcfg::parse_ulcfg(&ulcfg_path)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| (e.game_id.clone(), e))
+        .collect();
 
-    if let Ok(dir_entries) = std::fs::read_dir(&dest_path) {
-        for entry in dir_entries.flatten() {
+    // Group chunk files on disk by game id.
+    // value: (crc, parts count, total size)
+    let mut groups: BTreeMap<String, (String, u16, u64)> = BTreeMap::new();
+    if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
+        for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with("ul.") && name != "ul.cfg" {
-                // Extract game ID from filename
-                let game_id = name
-                    .strip_prefix("ul.")
-                    .unwrap_or(&name)
-                    .split('.')
-                    .next()
-                    .unwrap_or("")
-                    .to_string();
-
-                if !game_id.is_empty() {
-                    // Count parts
-                    let mut parts = 0u16;
-                    for part_entry in std::fs::read_dir(&dest_path).into_iter().flatten() {
-                        if let Ok(part_entry) = part_entry {
-                            let part_name = part_entry.file_name().to_string_lossy().to_string();
-                            if part_name.starts_with(&format!("ul.{}", game_id)) {
-                                parts += 1;
-                            }
-                        }
-                    }
-
-                    // Try reading title from the first split chunk (contains ISO header)
-                    let first_chunk = dest_path.join(format!("ul.{}", game_id));
-                    let title = read_iso_title(&first_chunk)
-                        .unwrap_or_else(|| game_id.clone());
-
-                    entries.push(UlEntry {
-                        title,
-                        game_id,
-                        parts: parts.max(1),
-                        mount_point: dest_dir.clone(),
-                    });
-                }
+            if let Some((crc, game_id, _part)) = parse_chunk_name(&name) {
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let g = groups.entry(game_id).or_insert((crc, 0, 0));
+                g.1 += 1;
+                g.2 += size;
             }
+        }
+    }
+
+    let mut entries = Vec::new();
+    for (game_id, (_crc, parts, total)) in groups {
+        if let Some(prev) = existing.get(&game_id) {
+            entries.push(UlEntry {
+                title: prev.title.clone(),
+                game_id,
+                parts,
+                media: prev.media,
+                mount_point: dest_dir.clone(),
+            });
+        } else {
+            entries.push(UlEntry {
+                title: game_id.clone(),
+                game_id,
+                parts,
+                media: detect_media(total),
+                mount_point: dest_dir.clone(),
+            });
         }
     }
 
     let count = entries.len();
     ulcfg::write_ulcfg(&ulcfg_path, &entries).map_err(|e| e.to_string())?;
-
     Ok(count)
 }
 
-/// Verify checksums of existing game files on device.
+/// Verify that each game's chunk files exist and are non-empty.
 #[tauri::command]
 pub fn verify_games(dest_dir: String) -> Result<VerifyResult, String> {
     let dest_path = PathBuf::from(&dest_dir);
@@ -209,15 +274,20 @@ pub fn verify_games(dest_dir: String) -> Result<VerifyResult, String> {
     let mut errors = 0;
 
     for entry in &entries {
-        // Check if the ul. file exists
-        let file_path = dest_path.join(format!("ul.{}", entry.game_id));
-        if file_path.exists() {
-            // For simplicity, just check file size > 0
-            // In production, would re-compute and verify checksums
-            match std::fs::metadata(&file_path) {
-                Ok(meta) if meta.len() > 0 => verified += 1,
-                _ => errors += 1,
+        let crc_hex = opl_crc::crc32_hex(&entry.title);
+        let mut ok = entry.parts > 0;
+        for i in 0..entry.parts.max(1) as u32 {
+            let name = split::chunk_file_name(&crc_hex, &entry.game_id, i);
+            match std::fs::metadata(dest_path.join(name)) {
+                Ok(m) if m.len() > 0 => {}
+                _ => {
+                    ok = false;
+                    break;
+                }
             }
+        }
+        if ok {
+            verified += 1;
         } else {
             errors += 1;
         }
@@ -238,7 +308,7 @@ pub struct GameEntry {
     pub title: String,
     pub parts: u16,
     pub size: u64,
-    pub location: String, // "root/ul.xxx", "CD/xxx.iso", "DVD/xxx.iso"
+    pub location: String, // "root", "CD", "DVD"
     pub mode: String,     // "split" or "nosplit"
 }
 
@@ -248,21 +318,12 @@ pub fn list_device_games(dest_dir: String) -> Result<Vec<GameEntry>, String> {
     let dest_path = PathBuf::from(&dest_dir);
     let mut games: Vec<GameEntry> = Vec::new();
 
-    // 1. Parse ul.cfg for split-mode entries
+    // 1. Parse ul.cfg for split-mode entries (one entry == one game, already grouped).
     let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
     if let Ok(entries) = ulcfg::parse_ulcfg(&ulcfg_path) {
         for entry in entries {
-            let mut total_size: u64 = 0;
-            for i in 0..entry.parts {
-                let part_name = if i == 0 || entry.parts == 1 {
-                    format!("ul.{}", entry.game_id)
-                } else {
-                    format!("ul.{}.{:02}", entry.game_id, i)
-                };
-                if let Ok(meta) = std::fs::metadata(dest_path.join(&part_name)) {
-                    total_size += meta.len();
-                }
-            }
+            let crc_hex = opl_crc::crc32_hex(&entry.title);
+            let total_size = sum_chunk_sizes(&dest_path, &crc_hex, &entry.game_id, entry.parts);
             games.push(GameEntry {
                 game_id: entry.game_id,
                 title: entry.title,
@@ -274,20 +335,24 @@ pub fn list_device_games(dest_dir: String) -> Result<Vec<GameEntry>, String> {
         }
     }
 
-    // 2. Scan CD/ and DVD/ for no-split ISOs — read title from ISO header
+    // 2. Scan CD/ and DVD/ for no-split ISOs — read title from ISO header.
     for subdir in &["CD", "DVD"] {
         let dir = dest_path.join(subdir);
-        if !dir.exists() { continue; }
+        if !dir.exists() {
+            continue;
+        }
         if let Ok(read_dir) = std::fs::read_dir(&dir) {
             for entry in read_dir.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
-                if !name.ends_with(".iso") { continue; }
+                if !name.ends_with(".iso") {
+                    continue;
+                }
                 let game_id = name.strip_suffix(".iso").unwrap_or(&name).to_string();
-                if game_id.is_empty() { continue; }
+                if game_id.is_empty() {
+                    continue;
+                }
                 let path = entry.path();
                 let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-
-                // Read volume label from ISO header for real title
                 let title = read_iso_title(&path).unwrap_or_else(|| game_id.clone());
 
                 games.push(GameEntry {
@@ -302,25 +367,34 @@ pub fn list_device_games(dest_dir: String) -> Result<Vec<GameEntry>, String> {
         }
     }
 
-    // 3. Fallback: scan root for ul.* files not in ul.cfg
+    // 3. Fallback: group root ul.* chunk files not already covered by ul.cfg.
+    let known_ids: std::collections::HashSet<String> =
+        games.iter().map(|g| g.game_id.clone()).collect();
+    // value: (parts count, total size)
+    let mut orphans: BTreeMap<String, (u16, u64)> = BTreeMap::new();
     if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
-        let known_ids: Vec<String> = games.iter().map(|g| g.game_id.clone()).collect();
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if !name.starts_with("ul.") || name == "ul.cfg" { continue; }
-            let game_id = name.strip_prefix("ul.").unwrap_or(&name)
-                .split('.').next().unwrap_or("").to_string();
-            if game_id.is_empty() || known_ids.contains(&game_id) { continue; }
-            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
-            games.push(GameEntry {
-                game_id: game_id.clone(),
-                title: game_id,
-                parts: 1,
-                size,
-                location: "root".into(),
-                mode: "split".into(),
-            });
+            if let Some((_crc, game_id, _part)) = parse_chunk_name(&name) {
+                if known_ids.contains(&game_id) {
+                    continue;
+                }
+                let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+                let g = orphans.entry(game_id).or_insert((0, 0));
+                g.0 += 1;
+                g.1 += size;
+            }
         }
+    }
+    for (game_id, (parts, size)) in orphans {
+        games.push(GameEntry {
+            title: game_id.clone(),
+            game_id,
+            parts,
+            size,
+            location: "root".into(),
+            mode: "split".into(),
+        });
     }
 
     Ok(games)
@@ -337,27 +411,40 @@ fn read_iso_title(path: &std::path::Path) -> Option<String> {
     file.read_exact(&mut label).ok()?;
     let label_str = String::from_utf8_lossy(&label);
     let trimmed = label_str.trim_end_matches(' ').trim_end_matches('\0');
-    if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 /// Delete a game from the device.
 #[tauri::command]
-pub fn delete_game(dest_dir: String, game_id: String, mode: String, location: String) -> Result<(), String> {
+pub fn delete_game(
+    dest_dir: String,
+    game_id: String,
+    mode: String,
+    location: String,
+) -> Result<(), String> {
     let dest_path = PathBuf::from(&dest_dir);
 
     if mode == "nosplit" {
         // Delete ISO from CD/ or DVD/
         let iso_path = dest_path.join(&location).join(format!("{}.iso", game_id));
-        std::fs::remove_file(&iso_path).map_err(|e| format!("Failed to delete {}: {}", iso_path.display(), e))?;
+        std::fs::remove_file(&iso_path)
+            .map_err(|e| format!("Failed to delete {}: {}", iso_path.display(), e))?;
     } else {
-        // Delete ul.xxx files and ul.cfg entry
-        for i in 0..100 {
-            let name = if i == 0 { format!("ul.{}", game_id) } else { format!("ul.{}.{:02}", game_id, i) };
-            let path = dest_path.join(&name);
-            if path.exists() {
-                std::fs::remove_file(&path).map_err(|e| format!("Failed to delete {}: {}", name, e))?;
-            } else if i > 0 {
-                break; // no more parts
+        // Delete every chunk file `ul.<crc>.<game_id>.<part>` for this game id
+        // (crc-agnostic — we match by the game id embedded in the filename).
+        if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some((_crc, id, _part)) = parse_chunk_name(&name) {
+                    if id == game_id {
+                        std::fs::remove_file(entry.path())
+                            .map_err(|e| format!("Failed to delete {}: {}", name, e))?;
+                    }
+                }
             }
         }
         // Remove from ul.cfg
@@ -372,7 +459,13 @@ pub fn delete_game(dest_dir: String, game_id: String, mode: String, location: St
 
 /// Rename a game title.
 #[tauri::command]
-pub fn rename_game(dest_dir: String, game_id: String, mode: String, location: String, new_title: String) -> Result<(), String> {
+pub fn rename_game(
+    dest_dir: String,
+    game_id: String,
+    mode: String,
+    location: String,
+    new_title: String,
+) -> Result<(), String> {
     let dest_path = PathBuf::from(&dest_dir);
 
     if mode == "nosplit" {
@@ -384,6 +477,22 @@ pub fn rename_game(dest_dir: String, game_id: String, mode: String, location: St
                 .map_err(|e| format!("Failed to rename: {}", e))?;
         }
     } else {
+        // Changing the title changes the CRC, so every chunk file must be
+        // renamed from ul.<oldcrc>.<id>.<part> to ul.<newcrc>.<id>.<part>.
+        let new_crc = opl_crc::crc32_hex(&new_title);
+        if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some((crc, id, part)) = parse_chunk_name(&name) {
+                    if id == game_id && crc != new_crc {
+                        let new_name = format!("ul.{}.{}.{}", new_crc, id, part);
+                        std::fs::rename(entry.path(), dest_path.join(&new_name))
+                            .map_err(|e| format!("Failed to rename {}: {}", name, e))?;
+                    }
+                }
+            }
+        }
+
         // Update title in ul.cfg
         let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
         if ulcfg_path.exists() {
@@ -400,7 +509,17 @@ pub fn rename_game(dest_dir: String, game_id: String, mode: String, location: St
     Ok(())
 }
 
-/// Repair old-format split files (ul.00, ul.01) to USBExtreme format (ul.<game_id>, ul.<game_id>.01).
+/// Migrate games written by this app's old (non-OPL) format into the real
+/// USBExtreme format, so they display correctly here and boot on a real PS2.
+///
+/// Old format on disk:
+/// - chunk files `ul.<game_id>` (part 0), `ul.<game_id>.01`, `ul.<game_id>.02`, ...
+/// - a 66-byte `ul.cfg` record: title[0..32], parts(u16)[32..34], id[34..66]
+///
+/// The old `ul.cfg` preserved the real title, so migration is lossless: we read
+/// each old entry, compute the correct CRC from the title, rename the chunks to
+/// `ul.<crc>.<game_id>.<part>`, and rewrite `ul.cfg` in the real 64-byte format.
+/// Returns the number of games migrated.
 #[tauri::command]
 pub fn repair_split_files(dest_dir: String) -> Result<u32, String> {
     let dest_path = PathBuf::from(&dest_dir);
@@ -409,89 +528,114 @@ pub fn repair_split_files(dest_dir: String) -> Result<u32, String> {
         return Ok(0);
     }
 
-    let entries = ulcfg::parse_ulcfg(&ulcfg_path).map_err(|e| e.to_string())?;
-    let mut repaired = 0u32;
-
-    for entry in &entries {
-        if entry.parts <= 1 {
-            // Single-part game: just need ul.<game_id>
-            let correct_name = format!("ul.{}", entry.game_id);
-            let correct_path = dest_path.join(&correct_name);
-            if !correct_path.exists() {
-                // Look for old-format single file
-                if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
-                    for dir_entry in read_dir.flatten() {
-                        let name = dir_entry.file_name().to_string_lossy().to_string();
-                        if name.starts_with("ul.") && name != "ul.cfg" && name != correct_name {
-                            // Check if this could be the old file for this game
-                            // Old single-part: ul.<something> where something is not a numbered part
-                            let suffix = name.strip_prefix("ul.").unwrap_or("");
-                            if !suffix.contains('.') && suffix == entry.game_id {
-                                // Already correct, skip
-                            } else if !suffix.starts_with(|c: char| c.is_ascii_digit()) {
-                                // Not a numbered part, might be a different game
-                            }
-                        }
-                    }
-                }
-            }
-            continue;
-        }
-
-        // Multi-part game: check if correct files exist
-        let first_correct = format!("ul.{}", entry.game_id);
-        let first_correct_path = dest_path.join(&first_correct);
-
-        if first_correct_path.exists() {
-            // Check if part 1 exists with correct name
-            let part1_correct = format!("ul.{}.{:02}", entry.game_id, 1);
-            if dest_path.join(&part1_correct).exists() {
-                continue; // Already correct
-            }
-        }
-
-        // Correct files don't exist — look for old-format files
-        // Old format: ul.00, ul.01, ul.02, ... (indexed by position, not game_id)
-        // We need to find consecutive numbered files that belong to this game
-        let mut old_files: Vec<(u32, std::path::PathBuf)> = Vec::new();
-        if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
-            for dir_entry in read_dir.flatten() {
-                let name = dir_entry.file_name().to_string_lossy().to_string();
-                if let Some(rest) = name.strip_prefix("ul.") {
-                    if rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
-                        if let Ok(idx) = rest.parse::<u32>() {
-                            old_files.push((idx, dir_entry.path()));
-                        }
-                    }
-                }
-            }
-        }
-
-        if old_files.is_empty() {
-            continue;
-        }
-
-        old_files.sort_by_key(|(idx, _)| *idx);
-        let total_parts = old_files.len().min(entry.parts as usize);
-
-        for i in 0..total_parts {
-            let old_path = &old_files[i as usize].1;
-            let new_name = if i == 0 {
-                format!("ul.{}", entry.game_id)
-            } else {
-                format!("ul.{}.{:02}", entry.game_id, i)
-            };
-            let new_path = dest_path.join(&new_name);
-
-            if old_path != &new_path && !new_path.exists() {
-                std::fs::rename(old_path, &new_path)
-                    .map_err(|e| format!("Failed to rename {}: {}", old_path.display(), e))?;
-                repaired += 1;
-            }
-        }
+    // Already converted → nothing to do.
+    if ulcfg::is_real_format(&ulcfg_path) {
+        return Ok(0);
     }
 
-    Ok(repaired)
+    let old_entries = parse_old_ulcfg(&ulcfg_path).map_err(|e| e.to_string())?;
+    if old_entries.is_empty() {
+        return Ok(0);
+    }
+
+    // Safety guard: only migrate if there is real evidence of the OLD naming on
+    // disk (a part-0 file `ul.<game_id>`). Without this, a real (USBUtil) ul.cfg
+    // that happens to lack the magic byte could be misparsed and clobbered.
+    let has_old_evidence = old_entries
+        .iter()
+        .any(|e| dest_path.join(format!("ul.{}", e.game_id)).exists());
+    if !has_old_evidence {
+        return Ok(0);
+    }
+
+    let mut new_entries: Vec<UlEntry> = Vec::new();
+    let mut migrated = 0u32;
+
+    for old in &old_entries {
+        let crc_hex = opl_crc::crc32_hex(&old.title);
+        let parts = old.parts.max(1);
+        let mut total_size = 0u64;
+        let mut renamed_any = false;
+
+        for i in 0..parts as u32 {
+            // Old naming: part 0 is `ul.<id>`, later parts are `ul.<id>.NN` (decimal).
+            let old_name = if i == 0 {
+                format!("ul.{}", old.game_id)
+            } else {
+                format!("ul.{}.{:02}", old.game_id, i)
+            };
+            let old_path = dest_path.join(&old_name);
+            let new_name = split::chunk_file_name(&crc_hex, &old.game_id, i);
+            let new_path = dest_path.join(&new_name);
+
+            if old_path.exists() && old_path != new_path {
+                if !new_path.exists() {
+                    std::fs::rename(&old_path, &new_path)
+                        .map_err(|e| format!("Failed to rename {}: {}", old_name, e))?;
+                    renamed_any = true;
+                }
+            }
+            if let Ok(m) = std::fs::metadata(&new_path) {
+                total_size += m.len();
+            }
+        }
+
+        if renamed_any {
+            migrated += 1;
+        }
+
+        new_entries.push(UlEntry {
+            title: old.title.clone(),
+            game_id: old.game_id.clone(),
+            parts,
+            media: detect_media(total_size),
+            mount_point: dest_dir.clone(),
+        });
+    }
+
+    // Rewrite ul.cfg in the real 64-byte format.
+    ulcfg::write_ulcfg(&ulcfg_path, &new_entries).map_err(|e| e.to_string())?;
+
+    Ok(migrated)
+}
+
+/// Minimal reader for the app's OLD 66-byte `ul.cfg` format (migration only).
+struct OldEntry {
+    title: String,
+    game_id: String,
+    parts: u16,
+}
+
+fn parse_old_ulcfg(path: &std::path::Path) -> std::io::Result<Vec<OldEntry>> {
+    const OLD_ENTRY_SIZE: usize = 66;
+    const TITLE: usize = 32;
+
+    let data = std::fs::read(path)?;
+    let mut entries = Vec::new();
+    let mut offset = 0;
+
+    while offset + OLD_ENTRY_SIZE <= data.len() {
+        let title = null_str(&data[offset..offset + TITLE]);
+        let parts = u16::from_le_bytes([data[offset + TITLE], data[offset + TITLE + 1]]);
+        let game_id = null_str(&data[offset + TITLE + 2..offset + OLD_ENTRY_SIZE]);
+
+        if !title.is_empty() {
+            entries.push(OldEntry {
+                title,
+                game_id,
+                // Guard against garbage from a mis-detected format.
+                parts: parts.clamp(1, 255),
+            });
+        }
+        offset += OLD_ENTRY_SIZE;
+    }
+
+    Ok(entries)
+}
+
+fn null_str(bytes: &[u8]) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).to_string()
 }
 
 /// Get current app settings.
@@ -510,4 +654,31 @@ pub fn save_settings(settings: AppSettings, state: State<AppState>) -> Result<()
     let mut current = state.settings.lock().map_err(|e| e.to_string())?;
     *current = settings;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_chunk_name() {
+        assert_eq!(
+            parse_chunk_name("ul.FBDF6400.SLUS_217.46.00"),
+            Some(("FBDF6400".into(), "SLUS_217.46".into(), "00".into()))
+        );
+        assert_eq!(
+            parse_chunk_name("ul.0A1B2C3D.SCUS_971.24.02"),
+            Some(("0A1B2C3D".into(), "SCUS_971.24".into(), "02".into()))
+        );
+        assert_eq!(parse_chunk_name("ul.cfg"), None);
+        assert_eq!(parse_chunk_name("random.iso"), None);
+        // Too few tokens (old-format leftover) is not a valid real chunk name.
+        assert_eq!(parse_chunk_name("ul.SLUS_21746"), None);
+    }
+
+    #[test]
+    fn test_detect_media() {
+        assert_eq!(detect_media(600 * 1024 * 1024), ulcfg::MEDIA_CD);
+        assert_eq!(detect_media(3 * 1024 * 1024 * 1024), ulcfg::MEDIA_DVD);
+    }
 }

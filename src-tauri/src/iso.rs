@@ -105,6 +105,43 @@ pub fn validate_iso(path: &Path) -> Result<IsoInfo, IsoError> {
     })
 }
 
+/// Read the raw PS2 startup id from an ISO's SYSTEM.CNF, WITH the dot preserved.
+///
+/// Returns e.g. `SLUS_217.46` (verbatim from `BOOT2 = cdrom0:\SLUS_217.46;1`).
+/// This is the form used for USBExtreme chunk filenames and the `ul.cfg` image
+/// field — unlike [`extract_game_id`], which strips the dot for display.
+pub fn extract_startup(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    extract_startup_raw(&mut file)
+}
+
+fn extract_startup_raw(file: &mut File) -> Option<String> {
+    let search_size: u64 = 4 * 1024 * 1024;
+    let file_size = file.metadata().ok()?.len();
+    let read_size = search_size.min(file_size);
+
+    file.seek(SeekFrom::Start(0)).ok()?;
+    let mut buffer = vec![0u8; read_size as usize];
+    file.read_exact(&mut buffer).ok()?;
+
+    let search_str = String::from_utf8_lossy(&buffer);
+    for line in search_str.lines() {
+        let trimmed = line.trim();
+        if trimmed.contains("BOOT2") && trimmed.contains("cdrom0:") {
+            if let Some(start) = trimmed.find('\\') {
+                let after_slash = &trimmed[start + 1..];
+                if let Some(end) = after_slash.find(';') {
+                    let id = after_slash[..end].trim();
+                    if !id.is_empty() {
+                        return Some(id.to_string());
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Extract PS2 game ID from SYSTEM.CNF embedded in the ISO.
 /// Searches for the BOOT2 line pattern: cdrom0:\XXXX_XXX.XX;1
 fn extract_game_id(file: &mut File) -> Result<String, IsoError> {

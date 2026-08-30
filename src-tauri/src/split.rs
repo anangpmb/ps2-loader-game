@@ -41,10 +41,9 @@ pub struct SplitConfig {
 impl Default for SplitConfig {
     fn default() -> Self {
         Self {
-            // USBExtreme chunk size: 4GB - 1 byte (0xFFFF_FFFF)
-            // But we use a practical size for FAT32 compatibility
-            chunk_size: 4_294_967_295 - 1, // 0xFFFFFFFE
-            buffer_size: 8 * 1024 * 1024,  // 8MB buffer
+            // USBExtreme standard chunk size: 1 GiB per part (matches OPL / USBUtil).
+            chunk_size: 1_073_741_824, // 0x40000000
+            buffer_size: 8 * 1024 * 1024, // 8MB buffer
             checksum_algo: ChecksumAlgo::Crc32,
             max_retries: 3,
         }
@@ -77,15 +76,25 @@ pub struct ProgressInfo {
     pub speed: String,
 }
 
+/// Build the USBExtreme chunk filename for a given part.
+///
+/// Real OPL naming convention (every part, including the first):
+/// `ul.<CRC32 of name>.<game_id>.<part>` where the part index is uppercase hex,
+/// zero-padded to two digits. `crc_hex` must be the CRC of the display name
+/// (see [`crate::opl_crc`]).
+pub fn chunk_file_name(crc_hex: &str, game_id: &str, part: u32) -> String {
+    format!("ul.{}.{}.{:02X}", crc_hex, game_id, part)
+}
+
 /// Split an ISO file into USBExtreme format chunks.
 ///
-/// USBExtreme naming convention: ul.<game_id>
-/// For multi-part: ul.<game_id>.00, ul.<game_id>.01, ...
+/// Files are named `ul.<crc_hex>.<game_id>.<part>` (see [`chunk_file_name`]).
 ///
 /// Returns chunk info with checksums for verification.
 pub fn split_iso<F>(
     source: &Path,
     dest_dir: &Path,
+    crc_hex: &str,
     game_id: &str,
     config: &SplitConfig,
     mut on_progress: F,
@@ -105,14 +114,8 @@ where
     let mut chunks = Vec::new();
 
     for chunk_idx in 0..total_chunks {
-        let chunk_file_name = if total_chunks == 1 {
-            format!("ul.{}", game_id)
-        } else if chunk_idx == 0 {
-            format!("ul.{}", game_id)
-        } else {
-            format!("ul.{}.{:02}", game_id, chunk_idx)
-        };
-        let chunk_path = dest_dir.join(&chunk_file_name);
+        let chunk_name = chunk_file_name(crc_hex, game_id, chunk_idx);
+        let chunk_path = dest_dir.join(&chunk_name);
 
         let chunk_start = (chunk_idx as u64) * config.chunk_size;
         let chunk_end = (chunk_start + config.chunk_size).min(file_size);
@@ -358,8 +361,23 @@ mod tests {
     #[test]
     fn test_split_config_default() {
         let config = SplitConfig::default();
-        assert_eq!(config.chunk_size, 4_294_967_294);
+        assert_eq!(config.chunk_size, 1_073_741_824);
         assert_eq!(config.buffer_size, 8 * 1024 * 1024);
         assert_eq!(config.max_retries, 3);
+    }
+
+    #[test]
+    fn test_chunk_file_name() {
+        assert_eq!(
+            chunk_file_name("FBDF6400", "SLUS_217.46", 0),
+            "ul.FBDF6400.SLUS_217.46.00"
+        );
+        assert_eq!(
+            chunk_file_name("FBDF6400", "SLUS_217.46", 2),
+            "ul.FBDF6400.SLUS_217.46.02"
+        );
+        // Part index is uppercase hex, so part 16 is "10", part 10 is "0A".
+        assert_eq!(chunk_file_name("0", "X", 16), "ul.0.X.10");
+        assert_eq!(chunk_file_name("0", "X", 10), "ul.0.X.0A");
     }
 }

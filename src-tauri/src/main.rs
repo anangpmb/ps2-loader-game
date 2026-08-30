@@ -1,6 +1,7 @@
 mod commands;
 mod filesystem;
 mod iso;
+mod opl_crc;
 mod split;
 mod ulcfg;
 

@@ -2,12 +2,39 @@ name: Build & Release
 
 on:
   push:
+    branches: [main]
     tags: ['v*']
   workflow_dispatch:
 
 jobs:
+  changes:
+    name: Detect changes
+    # Only meaningful on branch pushes; tags & manual runs skip straight to build.
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/heads/')
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.filter.outputs.build }}
+    steps:
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            build:
+              - 'src/**'
+              - 'src-tauri/**'
+              - 'package.json'
+              - 'package-lock.json'
+              - '.github/workflows/build.yml'
+
   build-macos:
     name: macOS
+    needs: changes
+    # Build for tags (release) & manual runs always; on main only when build inputs changed.
+    if: >-
+      !cancelled()
+      && (startsWith(github.ref, 'refs/tags/')
+      || github.event_name == 'workflow_dispatch'
+      || needs.changes.outputs.build == 'true')
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -55,6 +82,12 @@ jobs:
 
   build-windows:
     name: Windows
+    needs: changes
+    if: >-
+      !cancelled()
+      && (startsWith(github.ref, 'refs/tags/')
+      || github.event_name == 'workflow_dispatch'
+      || needs.changes.outputs.build == 'true')
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
