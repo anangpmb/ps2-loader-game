@@ -4,7 +4,7 @@ const App = (() => {
   // ── State ──
   const state = {
     queue: [],
-    settings: {
+    settings: JSON.parse(localStorage.getItem('ps2bt-settings') || 'null') || {
       bufferSize: 8,
       checksum: 'crc32',
       maxRetries: 3,
@@ -136,16 +136,21 @@ const App = (() => {
         return invoke('list_devices');
       }
       // Browser mode: a "device" is a folder the user grants access to.
-      const asDevice = () => (destDirHandle ? [{
-        name: destDirHandle.name,
-        filesystem: 'Browser FS',
-        free_space: 0,
-        total_space: 0,
-        recommended_mode: 'nosplit',
-        mount_point: destDirHandle.name,
-      }] : []);
+      const asDevice = async () => {
+        if (!destDirHandle) return [];
+        let hasUlcfg = false;
+        try { await destDirHandle.getFileHandle('ul.cfg'); hasUlcfg = true; } catch {}
+        return [{
+          name: destDirHandle.name,
+          filesystem: 'Browser FS',
+          free_space: 0,
+          total_space: 0,
+          recommended_mode: hasUlcfg ? 'split' : 'nosplit',
+          mount_point: destDirHandle.name,
+        }];
+      };
 
-      if (destDirHandle) return asDevice();
+      if (destDirHandle) return await asDevice();
 
       // Only open the OS folder picker in response to a user gesture. On page
       // load (interactive=false) we stay quiet instead of throwing.
@@ -187,12 +192,13 @@ const App = (() => {
         format = 'ISO9660';
       }
       const valid = format !== null;
+      const gameId = await readGameIdFromFile(file) || file.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_');
       return {
         valid,
         size: file.size,
         format,
         error: valid ? null : 'Not a valid ISO9660 image (missing CD001 header)',
-        game_id: file.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_'),
+        game_id: gameId,
       };
     },
 
@@ -210,9 +216,11 @@ const App = (() => {
       if (!destDirHandle) throw new Error('No destination folder. Click "Refresh" to select one.');
       if (!queueItem.file) throw new Error('No file data. Re-drop the ISO.');
 
-      const title = queueItem.name.replace(/\.[^.]+$/, '');
-      // gameId keeps dots (e.g. SLUS_217.46) but strips other unsafe chars.
-      const gameId = queueItem.gameId || title.replace(/[^a-zA-Z0-9_.]/g, '_');
+      // Extract real metadata from ISO header
+      const isoTitle = await readIsoTitleFromFile(queueItem.file) || queueItem.name.replace(/\.[^.]+$/, '');
+      const isoGameId = await readGameIdFromFile(queueItem.file);
+      const gameId = isoGameId || queueItem.gameId || queueItem.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_.]/g, '_');
+      const title = isoTitle;
       const fileSize = queueItem.file.size;
       const isSplit = queueItem.mode === 'split';
       const CHUNK_SIZE = 1073741824; // 1 GiB — matches OPL / backend
@@ -623,7 +631,9 @@ const App = (() => {
   function updateDeviceDisplay(dev) {
     const freeSpace = dev?.free_space ?? dev?.freeSpace ?? 0;
     const totalSpace = dev?.total_space ?? dev?.totalSpace ?? 0;
-    const mode = dev?.recommended_mode ?? dev?.mode ?? 'auto';
+    const recommendedMode = dev?.recommended_mode ?? dev?.mode ?? 'auto';
+    const userMode = state.settings?.splitMode;
+    const mode = (userMode && userMode !== 'auto') ? userMode : recommendedMode;
     const fs = dev ? (typeof dev.filesystem === 'object' ? Object.keys(dev.filesystem)[0] : dev.filesystem) : '—';
 
     $('#device-fs').textContent = fs;
@@ -778,21 +788,58 @@ const App = (() => {
     }
   }
 
+  // Read ISO9660 volume label from a File handle (offset 0x8028, 40 bytes).
+  async function readIsoTitleFromFile(fileHandle) {
+    try {
+      const blob = fileHandle.slice(0x8028, 0x8028 + 40);
+      const buf = await blob.arrayBuffer();
+      const bytes = new Uint8Array(buf);
+      let end = bytes.indexOf(0);
+      if (end === -1) end = bytes.length;
+      const label = new TextDecoder().decode(bytes.slice(0, end)).trim();
+      return label || null;
+    } catch { return null; }
+  }
+
+  // Extract PS2 game ID (e.g. SLUS_200.00) from SYSTEM.CNF in the ISO.
+  // Searches first 4MB for BOOT2 = cdrom0:\SLUS_XXX.XX;1
+  async function readGameIdFromFile(file) {
+    try {
+      const SEARCH_SIZE = Math.min(4 * 1024 * 1024, file.size);
+      const buf = await file.slice(0, SEARCH_SIZE).arrayBuffer();
+      const text = new TextDecoder().decode(new Uint8Array(buf));
+      for (const line of text.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (trimmed.includes('BOOT2') && trimmed.includes('cdrom0:')) {
+          const slashIdx = trimmed.indexOf('\\');
+          if (slashIdx === -1) continue;
+          const afterSlash = trimmed.slice(slashIdx + 1);
+          const semiIdx = afterSlash.indexOf(';');
+          if (semiIdx === -1) continue;
+          const id = afterSlash.slice(0, semiIdx).trim();
+          if (id) return id; // e.g. "SLUS_200.00"
+        }
+      }
+      return null;
+    } catch { return null; }
+  }
+
   async function scanBrowserGames() {
     if (!destDirHandle) return [];
     const games = [];
     const known = new Set();
 
     // Sum chunk file sizes/parts grouped by game id.
-    const chunkGroups = {}; // gameId -> { size, parts }
+    const chunkGroups = {}; // gameId -> { size, parts, firstFile }
     for await (const [name, handle] of destDirHandle.entries()) {
       if (handle.kind !== 'file') continue;
       const p = parseChunkName(name);
       if (!p) continue;
       const file = await handle.getFile();
-      const g = chunkGroups[p.gameId] || { size: 0, parts: 0 };
+      const g = chunkGroups[p.gameId] || { size: 0, parts: 0, firstFile: null };
       g.size += file.size;
       g.parts += 1;
+      if (!g.firstFile) g.firstFile = file;
       chunkGroups[p.gameId] = g;
     }
 
@@ -809,8 +856,9 @@ const App = (() => {
     // Orphan chunk groups not listed in ul.cfg.
     for (const [gameId, g] of Object.entries(chunkGroups)) {
       if (known.has(gameId)) continue;
+      const title = g.firstFile ? (await readIsoTitleFromFile(g.firstFile)) || gameId : gameId;
       games.push({
-        game_id: gameId, title: gameId, parts: g.parts,
+        game_id: gameId, title, parts: g.parts,
         size: g.size, location: 'root', mode: 'split',
       });
     }
@@ -823,9 +871,10 @@ const App = (() => {
           if (handle.kind === 'file' && name.endsWith('.iso')) {
             const file = await handle.getFile();
             const gameId = name.replace(/\.iso$/, '');
+            const title = (await readIsoTitleFromFile(file)) || gameId;
             games.push({
               game_id: gameId,
-              title: gameId,
+              title,
               parts: 1,
               size: file.size,
               location: subdir,
@@ -876,7 +925,13 @@ const App = (() => {
     $('#btn-refresh-games').addEventListener('click', refreshDeviceGames);
     $('#sort-games').addEventListener('change', renderDeviceGames);
 
-    $('#btn-settings').addEventListener('click', () => $('#modal-settings').classList.add('modal-overlay--active'));
+    $('#btn-settings').addEventListener('click', () => {
+      $('#setting-buffer').value = state.settings.bufferSize;
+      $('#setting-checksum').value = state.settings.checksum;
+      $('#setting-retries').value = state.settings.maxRetries;
+      $('#setting-split-mode').value = state.settings.splitMode;
+      $('#modal-settings').classList.add('modal-overlay--active');
+    });
     $$('[data-close]').forEach(el => {
       el.addEventListener('click', () => $(`#${el.getAttribute('data-close')}`).classList.remove('modal-overlay--active'));
     });
@@ -885,9 +940,11 @@ const App = (() => {
       state.settings.checksum = $('#setting-checksum').value;
       state.settings.maxRetries = parseInt($('#setting-retries').value);
       state.settings.splitMode = $('#setting-split-mode').value;
+      localStorage.setItem('ps2bt-settings', JSON.stringify(state.settings));
       $('#modal-settings').classList.remove('modal-overlay--active');
       toast('success', 'Settings saved');
       log('info', `Settings: buffer=${state.settings.bufferSize}MB checksum=${state.settings.checksum} retries=${state.settings.maxRetries} mode=${state.settings.splitMode}`);
+      if (state.device) updateDeviceDisplay(state.device);
     });
 
     $('#btn-generate-ulcfg').addEventListener('click', async () => {
