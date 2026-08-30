@@ -759,37 +759,14 @@ const App = (() => {
       if (invoke) {
         await invoke('rename_game', { destDir: state.device.mount_point, gameId, mode, location, newTitle });
       } else {
-        if (mode === 'nosplit') {
-          const dir = await destDirHandle.getDirectoryHandle(location, { create: false });
-          const oldHandle = await dir.getFileHandle(`${gameId}.iso`);
-          const newHandle = await dir.getFileHandle(`${newTitle}.iso`, { create: true });
-          const writable = await newHandle.createWritable();
-          const file = await oldHandle.getFile();
-          await writable.write(file);
-          await writable.close();
-          await dir.removeEntry(`${gameId}.iso`);
-        } else {
-          // Title change ⇒ CRC change: rename every chunk file, then update ul.cfg.
-          const newCrc = Opl.hex(newTitle);
-          const renames = [];
-          for await (const [name, handle] of destDirHandle.entries()) {
-            if (handle.kind !== 'file') continue;
-            const p = parseChunkName(name);
-            if (p && p.gameId === gameId && p.crc !== newCrc) {
-              renames.push([name, `ul.${newCrc}.${p.gameId}.${p.part}`]);
-            }
-          }
-          for (const [oldName, newName] of renames) {
-            const oldHandle = await destDirHandle.getFileHandle(oldName);
-            const newHandle = await destDirHandle.getFileHandle(newName, { create: true });
-            const writable = await newHandle.createWritable();
-            await writable.write(await oldHandle.getFile());
-            await writable.close();
-            await destDirHandle.removeEntry(oldName);
-          }
+        if (mode === 'split') {
           const entries = await readUlcfgEntries();
-          for (const e of entries) if (e.gameId === gameId) e.title = newTitle;
+          const entry = entries.find(e => e.gameId === gameId);
+          if (entry) entry.title = newTitle;
           await writeUlcfgEntries(entries);
+        } else {
+          toast('info', 'Rename is only available for split-mode games (ul.cfg)');
+          return;
         }
       }
       toast('success', `Renamed to: ${newTitle}`);

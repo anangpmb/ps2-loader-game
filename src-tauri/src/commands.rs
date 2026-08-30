@@ -457,55 +457,32 @@ pub fn delete_game(
     Ok(())
 }
 
-/// Rename a game title.
+/// Rename a game title (metadata only — updates ul.cfg, no file rename).
 #[tauri::command]
 pub fn rename_game(
     dest_dir: String,
     game_id: String,
-    mode: String,
-    location: String,
+    _mode: String,
+    _location: String,
     new_title: String,
 ) -> Result<(), String> {
     let dest_path = PathBuf::from(&dest_dir);
-
-    if mode == "nosplit" {
-        // Rename ISO file: old_id.iso → new_title.iso
-        let old_path = dest_path.join(&location).join(format!("{}.iso", game_id));
-        let new_path = dest_path.join(&location).join(format!("{}.iso", new_title));
-        if old_path.exists() {
-            std::fs::rename(&old_path, &new_path)
-                .map_err(|e| format!("Failed to rename: {}", e))?;
-        }
-    } else {
-        // Changing the title changes the CRC, so every chunk file must be
-        // renamed from ul.<oldcrc>.<id>.<part> to ul.<newcrc>.<id>.<part>.
-        let new_crc = opl_crc::crc32_hex(&new_title);
-        if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
-            for entry in read_dir.flatten() {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if let Some((crc, id, part)) = parse_chunk_name(&name) {
-                    if id == game_id && crc != new_crc {
-                        let new_name = format!("ul.{}.{}.{}", new_crc, id, part);
-                        std::fs::rename(entry.path(), dest_path.join(&new_name))
-                            .map_err(|e| format!("Failed to rename {}: {}", name, e))?;
-                    }
-                }
-            }
-        }
-
-        // Update title in ul.cfg
-        let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
-        if ulcfg_path.exists() {
-            let mut entries = ulcfg::parse_ulcfg(&ulcfg_path).map_err(|e| e.to_string())?;
-            for entry in &mut entries {
-                if entry.game_id == game_id {
-                    entry.title = new_title.clone();
-                }
-            }
-            ulcfg::write_ulcfg(&ulcfg_path, &entries).map_err(|e| e.to_string())?;
+    let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
+    if !ulcfg_path.exists() {
+        return Err("ul.cfg not found".into());
+    }
+    let mut entries = ulcfg::parse_ulcfg(&ulcfg_path).map_err(|e| e.to_string())?;
+    let mut found = false;
+    for entry in &mut entries {
+        if entry.game_id == game_id {
+            entry.title = new_title.clone();
+            found = true;
         }
     }
-
+    if !found {
+        return Err(format!("Game {} not found in ul.cfg", game_id));
+    }
+    ulcfg::write_ulcfg(&ulcfg_path, &entries).map_err(|e| e.to_string())?;
     Ok(())
 }
 
