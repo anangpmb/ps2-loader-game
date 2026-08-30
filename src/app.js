@@ -142,16 +142,51 @@ const App = (() => {
   }
   async function writeUlcfgEntries(entries) {
     if (!destDirHandle) throw new Error('No destination folder selected');
+    const data = encodeUlcfg(entries);
+    log('info', `Writing ul.cfg: ${entries.length} entries, ${data.length} bytes to "${destDirHandle.name}"`);
+    
+    // Test if we can create any file
+    try {
+      const testHandle = await destDirHandle.getFileHandle('_test_write', { create: true });
+      const testW = await testHandle.createWritable();
+      await testW.write(new Uint8Array([1, 2, 3]));
+      await testW.close();
+      // Clean up test file
+      await destDirHandle.removeEntry('_test_write');
+      log('info', 'Write test passed - directory is writable');
+    } catch (e) {
+      log('error', `Write test failed: ${e.name}: ${e.message}`);
+      throw new Error(`Cannot write to folder "${destDirHandle.name}": ${e.message}`);
+    }
+    
+    // Try writing to ul.cfg
     try {
       const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
       const w = await handle.createWritable();
-      await w.write(encodeUlcfg(entries));
+      await w.write(data);
       await w.close();
       log('info', `ul.cfg updated: ${entries.length} entries`);
+      return;
     } catch (e) {
-      log('error', `ul.cfg write failed: ${e.message}`);
-      throw e;
+      log('warn', `ul.cfg write failed: ${e.name}: ${e.message}`);
     }
+    
+    // Fallback: try a different file name
+    const fallbackNames = ['ul.cfg.bak', '_ulcfg', 'ulcfg.dat'];
+    for (const name of fallbackNames) {
+      try {
+        const handle = await destDirHandle.getFileHandle(name, { create: true });
+        const w = await handle.createWritable();
+        await w.write(data);
+        await w.close();
+        log('info', `${name} updated: ${entries.length} entries (fallback)`);
+        return;
+      } catch (e) {
+        log('warn', `${name} write failed: ${e.name}: ${e.message}`);
+      }
+    }
+    
+    throw new Error('All ul.cfg write attempts failed. Check folder permissions.');
   }
 
   const Tauri = {
@@ -347,7 +382,7 @@ const App = (() => {
         for await (const [n2, h2] of destDirHandle.entries()) {
           if (h2.kind === 'file' && parseChunkName(n2)?.gameId === p.gameId) parts++;
         }
-        entries.push({ title: p.gameId, gameId: p.gameId, parts, media: 0x14 });
+        entries.push({ title: p.title, gameId: p.gameId, parts, media: 0x14 });
       }
       await writeUlcfgEntries(entries);
       return { success: true, entries: entries.length };
