@@ -170,6 +170,8 @@ const App = (() => {
     
     // Try writing to ul.cfg
     try {
+      // Delete existing file first (in case it's locked or read-only)
+      try { await destDirHandle.removeEntry('ul.cfg'); } catch {}
       const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
       const w = await handle.createWritable();
       await w.write(data);
@@ -184,6 +186,7 @@ const App = (() => {
     const fallbackNames = ['ul.cfg.bak', '_ulcfg', 'ulcfg.dat'];
     for (const name of fallbackNames) {
       try {
+        try { await destDirHandle.removeEntry(name); } catch {}
         const handle = await destDirHandle.getFileHandle(name, { create: true });
         const w = await handle.createWritable();
         await w.write(data);
