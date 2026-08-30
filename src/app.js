@@ -87,10 +87,18 @@ const App = (() => {
     for (let i = 0; i < n; i++) buf[off + i] = str.charCodeAt(i) & 0xFF;
   }
   function ulReadAscii(bytes, off, len) {
-    let end = off;
-    const max = Math.min(off + len, bytes.length);
-    while (end < max && bytes[end] !== 0) end++;
-    return new TextDecoder('ascii').decode(bytes.slice(off, end)).replace(/ +$/, '');
+    let result = "";
+    for (let i = 0; i < len; i++) {
+      const charCode = bytes[off + i];
+      if (charCode === 0x00) break;
+      if (charCode >= 32 && charCode <= 126) {
+        result += String.fromCharCode(charCode);
+      } else {
+        result += " ";
+      }
+    }
+    const cleaned = result.trim();
+    return cleaned.length > 0 ? cleaned : "UNKNOWN_GAME";
   }
   function encodeUlcfg(entries) {
     const buf = new Uint8Array(entries.length * UL_ENTRY_SIZE);
@@ -106,13 +114,22 @@ const App = (() => {
   }
   function parseUlcfg(bytes) {
     const entries = [];
-    for (let off = 0; off + UL_ENTRY_SIZE <= bytes.length; off += UL_ENTRY_SIZE) {
+    // Detect 64-byte header: if first record has no printable ASCII in name area, skip it
+    let startOff = 0;
+    if (bytes.length >= UL_ENTRY_SIZE * 2) {
+      let hasPrintable = false;
+      for (let i = 0; i < 32; i++) {
+        if (bytes[i] >= 32 && bytes[i] <= 126) { hasPrintable = true; break; }
+      }
+      if (!hasPrintable) startOff = UL_ENTRY_SIZE; // skip header
+    }
+    for (let off = startOff; off + UL_ENTRY_SIZE <= bytes.length; off += UL_ENTRY_SIZE) {
       const title = ulReadAscii(bytes, off, 32);
       const image = ulReadAscii(bytes, off + 0x20, 15);
       const gameId = image.startsWith('ul.') ? image.slice(3) : image;
       const parts = bytes[off + 0x2F];
       const media = bytes[off + 0x30];
-      if (title) entries.push({ title, gameId, parts, media });
+      if (title !== "UNKNOWN_GAME") entries.push({ title, gameId, parts, media });
     }
     return entries;
   }
@@ -124,10 +141,17 @@ const App = (() => {
     } catch (e) { return []; }
   }
   async function writeUlcfgEntries(entries) {
-    const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
-    const w = await handle.createWritable();
-    await w.write(encodeUlcfg(entries));
-    await w.close();
+    if (!destDirHandle) throw new Error('No destination folder selected');
+    try {
+      const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
+      const w = await handle.createWritable();
+      await w.write(encodeUlcfg(entries));
+      await w.close();
+      log('info', `ul.cfg updated: ${entries.length} entries`);
+    } catch (e) {
+      log('error', `ul.cfg write failed: ${e.message}`);
+      throw e;
+    }
   }
 
   const Tauri = {
@@ -295,14 +319,10 @@ const App = (() => {
 
       // Update binary ul.cfg (real 64-byte format).
       onProgress({ phase: 'ulcfg', pct: 0 });
-      try {
-        let entries = await readUlcfgEntries();
-        entries = entries.filter(e => e.gameId !== gameId);
-        entries.push({ title, gameId, parts: totalChunks, media });
-        await writeUlcfgEntries(entries);
-      } catch (e) {
-        log('warn', `ul.cfg write failed: ${e.message}`);
-      }
+      let entries = await readUlcfgEntries();
+      entries = entries.filter(e => e.gameId !== gameId);
+      entries.push({ title, gameId, parts: totalChunks, media });
+      await writeUlcfgEntries(entries);
       onProgress({ phase: 'ulcfg', pct: 100 });
 
       return { success: true, checksum: 'verified' };
@@ -313,7 +333,24 @@ const App = (() => {
         const count = await invoke('generate_ulcfg', { destDir: state.device?.mount_point || '/Volumes/USB' });
         return { success: true, entries: count };
       }
-      return { success: true, entries: state.queue.filter(q => q.status === 'done').length };
+      // Browser mode: rebuild ul.cfg from chunk files on disk
+      if (!destDirHandle) throw new Error('No destination folder selected');
+      const entries = [];
+      const seen = new Set();
+      for await (const [name, handle] of destDirHandle.entries()) {
+        if (handle.kind !== 'file') continue;
+        const p = parseChunkName(name);
+        if (!p || seen.has(p.gameId)) continue;
+        seen.add(p.gameId);
+        // Count parts for this game
+        let parts = 0;
+        for await (const [n2, h2] of destDirHandle.entries()) {
+          if (h2.kind === 'file' && parseChunkName(n2)?.gameId === p.gameId) parts++;
+        }
+        entries.push({ title: p.gameId, gameId: p.gameId, parts, media: 0x14 });
+      }
+      await writeUlcfgEntries(entries);
+      return { success: true, entries: entries.length };
     },
 
     async verifyGames() {
