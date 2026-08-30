@@ -336,6 +336,31 @@ pub async fn open_folder_dialog(app: tauri::AppHandle) -> Result<Option<String>,
     }
 }
 
+/// Format a drive to FAT32 and initialize it for OPL (create ul.cfg).
+/// WARNING: This erases ALL data on the drive!
+#[tauri::command]
+pub fn format_drive_for_opl(mount_point: String, volume_label: String) -> Result<String, String> {
+    let path = PathBuf::from(&mount_point);
+    
+    // Validate: must be an existing directory
+    if !path.exists() || !path.is_dir() {
+        return Err(format!("Invalid mount point: {}", mount_point));
+    }
+
+    // Get the device identifier for formatting
+    let device_info = filesystem::get_device_info(&path).map_err(|e| e.to_string())?;
+    
+    // Format the drive
+    filesystem::format_drive_fat32(&device_info, &volume_label)
+        .map_err(|e| e.to_string())?;
+    
+    // Create ul.cfg (empty)
+    let ulcfg_path = ulcfg::ulcfg_path(&path);
+    ulcfg::write_ulcfg(&ulcfg_path, &[]).map_err(|e| e.to_string())?;
+    
+    Ok(format!("Drive formatted as FAT32 ({}). ul.cfg created. Ready to add games.", volume_label))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameEntry {
     pub game_id: String,

@@ -1204,6 +1204,45 @@ const App = (() => {
       }
     });
 
+    $('#btn-format-opl').addEventListener('click', async () => {
+      if (!state.device?.mount_point) {
+        toast('error', 'Select a target drive first');
+        return;
+      }
+      const mountPoint = state.device.mount_point;
+      const driveName = state.device.name || mountPoint;
+      
+      // Confirmation dialog
+      const confirmed = confirm(
+        `WARNING: This will ERASE ALL DATA on "${driveName}"!\n\n` +
+        `The drive will be formatted as FAT32 and initialized for OPL.\n\n` +
+        `Are you sure you want to continue?`
+      );
+      if (!confirmed) return;
+
+      const label = prompt('Enter volume label (max 11 chars, e.g. "PS2USB"):', 'PS2USB');
+      if (!label) return;
+
+      log('info', `Formatting ${driveName} for OPL...`);
+      try {
+        if (invoke) {
+          const result = await invoke('format_drive_for_opl', {
+            mountPoint: mountPoint,
+            volumeLabel: label.substring(0, 11),
+          });
+          log('success', result);
+          toast('success', 'Drive formatted for OPL');
+          refreshDeviceGames();
+        } else {
+          log('warn', 'Format requires native mode (Tauri)');
+          toast('info', 'Not available in browser mode');
+        }
+      } catch (e) {
+        log('error', 'Format failed: ' + e.message);
+        toast('error', e.message);
+      }
+    });
+
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape') $$('.modal-overlay--active').forEach(m => m.classList.remove('modal-overlay--active'));
     });

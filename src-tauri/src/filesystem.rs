@@ -435,6 +435,165 @@ fn get_space_info(path: &Path) -> (u64, u64) {
     }
 }
 
+// ── Drive Formatting ──
+
+/// Format a drive to FAT32 with the given volume label.
+/// WARNING: This erases ALL data on the drive!
+pub fn format_drive_fat32(device: &DeviceInfo, label: &str) -> Result<(), FsError> {
+    #[cfg(target_os = "macos")]
+    {
+        format_drive_macos(device, label)
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        format_drive_windows(device, label)
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        format_drive_linux(device, label)
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn format_drive_macos(device: &DeviceInfo, label: &str) -> Result<(), FsError> {
+    use std::process::Command;
+
+    // Get the disk identifier (e.g., /dev/disk2) from mount point
+    let disk_id = get_disk_identifier_macos(&device.mount_point)?;
+    
+    let output = Command::new("diskutil")
+        .args([
+            "eraseDisk",
+            "FAT32",
+            label,
+            "MBRFormat",
+            &disk_id,
+        ])
+        .output()
+        .map_err(|e| FsError::DetectionFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(FsError::DetectionFailed(format!(
+            "diskutil eraseDisk failed: {}",
+            stderr
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn get_disk_identifier_macos(mount_point: &str) -> Result<String, FsError> {
+    use std::process::Command;
+
+    let output = Command::new("diskutil")
+        .args(["info", "-plist", mount_point])
+        .output()
+        .map_err(|e| FsError::DetectionFailed(e.to_string()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    
+    // Parse plist to get DeviceIdentifier
+    // Look for <key>DeviceIdentifier</key><string>disk2s1</string>
+    if let Some(start) = stdout.find("<key>DeviceIdentifier</key>") {
+        let rest = &stdout[start..];
+        if let Some(s_start) = rest.find("<string>") {
+            let s_rest = &rest[s_start + 8..];
+            if let Some(s_end) = s_rest.find("</string>") {
+                let disk_id = &s_rest[..s_end];
+                // Return parent disk (disk2s1 -> disk2)
+                if let Some(base) = disk_id.strip_suffix(|c: char| c.is_ascii_digit() || c == 's') {
+                    return Ok(format!("/dev/{}", base.trim_end_matches('s')));
+                }
+                return Ok(format!("/dev/{}", disk_id));
+            }
+        }
+    }
+
+    Err(FsError::DetectionFailed("Could not determine disk identifier".into()))
+}
+
+#[cfg(target_os = "windows")]
+fn format_drive_windows(device: &DeviceInfo, label: &str) -> Result<(), FsError> {
+    use std::process::Command;
+
+    // Get drive letter (e.g., "E:" from "E:\")
+    let drive = device
+        .mount_point
+        .chars()
+        .take(2)
+        .collect::<String>();
+
+    // Use format command: format E: /FS:FAT32 /V:LABEL /Q /Y
+    let output = Command::new("format")
+        .args([
+            &drive,
+            "/FS:FAT32",
+            &format!("/V:{}", label),
+            "/Q",  // Quick format
+            "/Y",  // Yes to confirmation
+        ])
+        .output()
+        .map_err(|e| FsError::DetectionFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(FsError::DetectionFailed(format!(
+            "format failed: {}",
+            stderr
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn format_drive_linux(device: &DeviceInfo, label: &str) -> Result<(), FsError> {
+    use std::process::Command;
+
+    // Get device path from mount point
+    let dev_path = get_device_path_linux(&device.mount_point)?;
+    
+    let output = Command::new("mkfs.fat")
+        .args([
+            "-F", "32",
+            "-n", label,
+            &dev_path,
+        ])
+        .output()
+        .map_err(|e| FsError::DetectionFailed(e.to_string()))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(FsError::DetectionFailed(format!(
+            "mkfs.fat failed: {}",
+            stderr
+        )));
+    }
+
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn get_device_path_linux(mount_point: &str) -> Result<String, FsError> {
+    use std::process::Command;
+
+    let output = Command::new("findmnt")
+        .args(["-n", "-o", "SOURCE", mount_point])
+        .output()
+        .map_err(|e| FsError::DetectionFailed(e.to_string()))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if stdout.is_empty() {
+        return Err(FsError::DetectionFailed("Could not determine device path".into()));
+    }
+
+    Ok(stdout)
+}
+
 // ── File Contiguity Check ──
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

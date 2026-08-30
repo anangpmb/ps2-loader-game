@@ -28,6 +28,7 @@ fn main() {
             commands::repair_split_files,
             commands::check_contiguity,
             commands::open_folder_dialog,
+            commands::format_drive_for_opl,
             commands::get_settings,
             commands::save_settings,
         ])
