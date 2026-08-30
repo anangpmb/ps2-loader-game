@@ -111,116 +111,71 @@ const App = (() => {
   }
   function parseUlcfg(bytes) {
     const entries = [];
-    // Detect 64-byte header: if first record has no printable ASCII in name area, skip it
-    let startOff = 0;
-    if (bytes.length >= UL_ENTRY_SIZE * 2) {
-      let hasPrintable = false;
-      for (let i = 0; i < 32; i++) {
-        if (bytes[i] >= 32 && bytes[i] <= 126) { hasPrintable = true; break; }
-      }
-      if (!hasPrintable) startOff = UL_ENTRY_SIZE;
-    }
-    for (let off = startOff; off + UL_ENTRY_SIZE <= bytes.length; off += UL_ENTRY_SIZE) {
-      const title = ulReadAscii(bytes, off, 32);
+    for (let off = 0; off + UL_ENTRY_SIZE <= bytes.length; off += UL_ENTRY_SIZE) {
+      const rawTitle = ulReadAscii(bytes, off, 32);
       const image = ulReadAscii(bytes, off + 0x20, 15);
-      const gameId = image.startsWith('ul.') ? image.slice(3) : image;
+
+      if (!image || image.trim() === '' || !image.startsWith('ul.')) continue;
+
+      const gameId = image.slice(3).trim();
       const parts = bytes[off + 0x2F];
       const media = bytes[off + 0x30];
-      if (title !== "UNKNOWN_GAME") {
-        // If title looks like a gameId (e.g., SLUS_200.00), use gameId as title
-        const isGameId = /^[A-Z]{2,4}[_-]\d{3}\.\d{2}$/.test(title);
-        entries.push({ title: isGameId ? gameId : title, gameId, parts, media });
+
+      let title = rawTitle;
+      if (!title || title === "UNKNOWN_GAME" || title.trim() === "") {
+        title = gameId;
       }
+
+      entries.push({ title, gameId, parts, media });
     }
     return entries;
   }
   async function readUlcfgEntries() {
     try {
-      // List all files under 100KB (likely config files, not game chunks)
-      const smallFiles = [];
-      for await (const [name, handle] of destDirHandle.entries()) {
-        if (handle.kind !== 'file') continue;
-        const file = await handle.getFile();
-        if (file.size < 102400) { // under 100KB
-          smallFiles.push({ name, size: file.size });
-        }
-      }
-      console.log('[ul.cfg] files under 100KB:', smallFiles);
-      
-      // Find ul.cfg or ul.cfg.bak
-      const ulcfgEntry = smallFiles.find(f => f.name.toLowerCase() === 'ul.cfg' || f.name.toLowerCase() === 'ul.cfg.bak');
-      if (!ulcfgEntry) {
-        console.log('[ul.cfg] not found in small files');
-        return [];
-      }
-      console.log('[ul.cfg] found:', ulcfgEntry);
-      const handle = await destDirHandle.getFileHandle(ulcfgEntry.name);
+      const handle = await destDirHandle.getFileHandle('ul.cfg');
       const file = await handle.getFile();
       const bytes = new Uint8Array(await file.arrayBuffer());
-      console.log('[ul.cfg] file size:', bytes.length, 'bytes');
-      const entries = parseUlcfg(bytes);
-      console.log('[ul.cfg] parsed entries:', entries.length);
-      if (entries.length > 0) console.log('[ul.cfg] first entry:', entries[0]);
-      return entries;
+      return parseUlcfg(bytes);
     } catch (e) {
-      console.error('[ul.cfg] read error:', e.message);
-      return [];
+      // Try fallback
+      try {
+        const handle = await destDirHandle.getFileHandle('ul.cfg.bak');
+        const file = await handle.getFile();
+        const bytes = new Uint8Array(await file.arrayBuffer());
+        return parseUlcfg(bytes);
+      } catch (e2) {
+        return [];
+      }
     }
   }
   async function writeUlcfgEntries(entries) {
     if (!destDirHandle) throw new Error('No destination folder selected');
     const data = encodeUlcfg(entries);
-    log('info', `Writing ul.cfg: ${entries.length} entries, ${data.length} bytes to "${destDirHandle.name}"`);
-    
-    // Log sample entries for debugging
-    const sample = entries.slice(0, 5);
-    for (const e of sample) {
-      log('info', `  → title="${e.title}" gameId="${e.gameId}" parts=${e.parts}`);
-    }
-    if (entries.length > 5) log('info', `  ... and ${entries.length - 5} more`);
-    
-    // Test if we can create any file
-    try {
-      const testHandle = await destDirHandle.getFileHandle('_test_write', { create: true });
-      const testW = await testHandle.createWritable();
-      await testW.write(new Uint8Array([1, 2, 3]));
-      await testW.close();
-      // Clean up test file
-      await destDirHandle.removeEntry('_test_write');
-      log('info', 'Write test passed - directory is writable');
-    } catch (e) {
-      log('error', `Write test failed: ${e.name}: ${e.message}`);
-      throw new Error(`Cannot write to folder "${destDirHandle.name}": ${e.message}`);
-    }
-    
-    // Try writing to ul.cfg
+    log('info', `Writing ul.cfg: ${entries.length} entries, ${data.length} bytes`);
+
     try {
       const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
       const w = await handle.createWritable();
       await w.write(data);
       await w.close();
-      log('info', `ul.cfg updated: ${entries.length} entries`);
+      log('info', `ul.cfg successfully updated: ${entries.length} entries`);
       return;
     } catch (e) {
-      log('warn', `ul.cfg write failed: ${e.name}: ${e.message}`);
+      log('warn', `Primary ul.cfg write failed: ${e.name}: ${e.message}`);
     }
-    
-    // Fallback: try a different file name
-    const fallbackNames = ['ul.cfg.bak', '_ulcfg', 'ulcfg.dat'];
-    for (const name of fallbackNames) {
-      try {
-        const handle = await destDirHandle.getFileHandle(name, { create: true });
-        const w = await handle.createWritable();
-        await w.write(data);
-        await w.close();
-        log('info', `${name} updated: ${entries.length} entries (fallback)`);
-        return;
-      } catch (e) {
-        log('warn', `${name} write failed: ${e.name}: ${e.message}`);
-      }
+
+    try {
+      const handle = await destDirHandle.getFileHandle('ul.cfg.bak', { create: true });
+      const w = await handle.createWritable();
+      await w.write(data);
+      await w.close();
+      log('info', `ul.cfg.bak updated as fallback: ${entries.length} entries`);
+      return;
+    } catch (e) {
+      log('error', `Fallback write failed: ${e.name}: ${e.message}`);
     }
-    
-    throw new Error('All ul.cfg write attempts failed. Check folder permissions.');
+
+    throw new Error('Failed to write ul.cfg. Check drive permissions or write-protection switch.');
   }
 
   const Tauri = {
