@@ -87,17 +87,11 @@ const App = (() => {
     for (let i = 0; i < n; i++) buf[off + i] = str.charCodeAt(i) & 0xFF;
   }
   function ulReadAscii(bytes, off, len) {
-    let result = "";
-    for (let i = 0; i < len; i++) {
-      const charCode = bytes[off + i];
-      if (charCode === 0x00) break;
-      if (charCode >= 32 && charCode <= 126) {
-        result += String.fromCharCode(charCode);
-      } else {
-        result += " ";
-      }
-    }
-    const cleaned = result.trim();
+    let end = off;
+    const max = Math.min(off + len, bytes.length);
+    while (end < max && bytes[end] !== 0) end++;
+    const raw = new TextDecoder('ascii').decode(bytes.slice(off, end));
+    const cleaned = raw.replace(/[^\x20-\x7E]/g, '').trim();
     return cleaned.length > 0 ? cleaned : "UNKNOWN_GAME";
   }
   function encodeUlcfg(entries) {
@@ -114,16 +108,7 @@ const App = (() => {
   }
   function parseUlcfg(bytes) {
     const entries = [];
-    // Detect 64-byte header: if first record has no printable ASCII in name area, skip it
-    let startOff = 0;
-    if (bytes.length >= UL_ENTRY_SIZE * 2) {
-      let hasPrintable = false;
-      for (let i = 0; i < 32; i++) {
-        if (bytes[i] >= 32 && bytes[i] <= 126) { hasPrintable = true; break; }
-      }
-      if (!hasPrintable) startOff = UL_ENTRY_SIZE; // skip header
-    }
-    for (let off = startOff; off + UL_ENTRY_SIZE <= bytes.length; off += UL_ENTRY_SIZE) {
+    for (let off = 0; off + UL_ENTRY_SIZE <= bytes.length; off += UL_ENTRY_SIZE) {
       const title = ulReadAscii(bytes, off, 32);
       const image = ulReadAscii(bytes, off + 0x20, 15);
       const gameId = image.startsWith('ul.') ? image.slice(3) : image;
@@ -136,9 +121,17 @@ const App = (() => {
   async function readUlcfgEntries() {
     try {
       const handle = await destDirHandle.getFileHandle('ul.cfg');
-      const bytes = new Uint8Array(await (await handle.getFile()).arrayBuffer());
-      return parseUlcfg(bytes);
-    } catch (e) { return []; }
+      const file = await handle.getFile();
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      console.log('[ul.cfg] file size:', bytes.length, 'bytes');
+      const entries = parseUlcfg(bytes);
+      console.log('[ul.cfg] parsed entries:', entries.length);
+      if (entries.length > 0) console.log('[ul.cfg] first entry:', entries[0]);
+      return entries;
+    } catch (e) {
+      console.error('[ul.cfg] read error:', e);
+      return [];
+    }
   }
   async function writeUlcfgEntries(entries) {
     if (!destDirHandle) throw new Error('No destination folder selected');
@@ -370,6 +363,7 @@ const App = (() => {
       }
       // Browser mode: rebuild ul.cfg from chunk files on disk
       if (!destDirHandle) throw new Error('No destination folder selected');
+      log('info', `Scanning "${destDirHandle.name}" for chunk files...`);
       const entries = [];
       const seen = new Set();
       for await (const [name, handle] of destDirHandle.entries()) {
@@ -382,8 +376,10 @@ const App = (() => {
         for await (const [n2, h2] of destDirHandle.entries()) {
           if (h2.kind === 'file' && parseChunkName(n2)?.gameId === p.gameId) parts++;
         }
-        entries.push({ title: p.title, gameId: p.gameId, parts, media: 0x14 });
+        entries.push({ title: p.gameId, gameId: p.gameId, parts, media: 0x14 });
+        log('info', `Found: ${p.gameId} (${parts} parts)`);
       }
+      log('info', `Found ${entries.length} games, writing ul.cfg...`);
       await writeUlcfgEntries(entries);
       return { success: true, entries: entries.length };
     },
@@ -1017,9 +1013,14 @@ const App = (() => {
 
     $('#btn-generate-ulcfg').addEventListener('click', async () => {
       log('info', 'Regenerating ul.cfg...');
-      const result = await Tauri.generateUlCfg();
-      toast('success', `ul.cfg — ${result.entries} entries`);
-      log('success', `ul.cfg: ${result.entries} entries`);
+      try {
+        const result = await Tauri.generateUlCfg();
+        toast('success', `ul.cfg — ${result.entries} entries`);
+        log('success', `ul.cfg: ${result.entries} entries`);
+      } catch (e) {
+        toast('error', `ul.cfg failed: ${e.message}`);
+        log('error', `ul.cfg failed: ${e.message}`);
+      }
     });
     $('#btn-verify').addEventListener('click', async () => {
       log('info', 'Verifying games...');
