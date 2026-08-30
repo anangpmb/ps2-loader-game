@@ -218,13 +218,12 @@ const App = (() => {
       if (!queueItem.file) throw new Error('No file data. Re-drop the ISO.');
 
       // Extract real metadata from ISO header
-      const isoTitle = await readIsoTitleFromFile(queueItem.file) || queueItem.name.replace(/\.[^.]+$/, '');
+      const title = queueItem.name.replace(/\.[^.]+$/, ''); // display name from filename
       const isoGameId = await readGameIdFromFile(queueItem.file);
-      const rawGameId = isoGameId || queueItem.gameId || queueItem.name.replace(/\.[^.]+$/, '');
+      const rawGameId = isoGameId || queueItem.gameId || title;
       // Sanitize gameId: keep dots, underscores, alphanum only (safe for filenames)
       const gameId = rawGameId.replace(/[^a-zA-Z0-9_.]/g, '_');
-      const title = isoTitle;
-      log('info', `ISO metadata: title="${title}" gameId="${gameId}" (raw="${rawGameId}")`);
+      log('info', `ISO metadata: title="${title}" gameId="${gameId}"`);
       const fileSize = queueItem.file.size;
       const isSplit = queueItem.mode === 'split';
       const CHUNK_SIZE = 1073741824; // 1 GiB — matches OPL / backend
@@ -856,9 +855,8 @@ const App = (() => {
     // Orphan chunk groups not listed in ul.cfg.
     for (const [gameId, g] of Object.entries(chunkGroups)) {
       if (known.has(gameId)) continue;
-      const title = g.firstFile ? (await readIsoTitleFromFile(g.firstFile)) || gameId : gameId;
       games.push({
-        game_id: gameId, title, parts: g.parts,
+        game_id: gameId, title: gameId, parts: g.parts,
         size: g.size, location: 'root', mode: 'split',
       });
     }
@@ -869,14 +867,12 @@ const App = (() => {
         const dirHandle = await destDirHandle.getDirectoryHandle(subdir);
         for await (const [name, handle] of dirHandle.entries()) {
           if (handle.kind === 'file' && name.endsWith('.iso')) {
-            const file = await handle.getFile();
             const gameId = name.replace(/\.iso$/, '');
-            const title = (await readIsoTitleFromFile(file)) || gameId;
             games.push({
               game_id: gameId,
-              title,
+              title: gameId,
               parts: 1,
-              size: file.size,
+              size: (await handle.getFile()).size,
               location: subdir,
               mode: 'nosplit',
             });

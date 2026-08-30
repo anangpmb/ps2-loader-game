@@ -153,18 +153,15 @@ pub async fn process_iso(
         }
     };
 
-    // Resolve the display title and the real startup id (used for naming).
-    // The title's CRC drives the chunk filenames, so it must be finalized here.
-    let title = read_iso_title(&source_path).unwrap_or_else(|| {
-        ulcfg::extract_title(
-            source_path
-                .file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default()
-                .as_str(),
-        )
-    });
-    // Prefer the ISO's own startup id (e.g. "SLUS_217.46") over the frontend's.
+    // Display title = filename without extension (user can rename file to change title)
+    let title = ulcfg::extract_title(
+        source_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
+            .as_str(),
+    );
+    // Game ID = region code from ISO header (e.g. "SLUS_217.46")
     let game_id = iso::extract_startup(&source_path).unwrap_or(game_id);
     let crc_hex = opl_crc::crc32_hex(&title);
 
