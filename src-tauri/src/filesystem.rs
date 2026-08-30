@@ -137,6 +137,26 @@ fn detect_devices_macos() -> Result<Vec<DeviceInfo>, FsError> {
         }
     }
 
+    // Fallback: if no removable devices found, show all non-system volumes
+    if devices.is_empty() {
+        if volumes_dir.exists() {
+            for entry in std::fs::read_dir(volumes_dir)? {
+                let entry = entry?;
+                let path = entry.path();
+                if path.is_dir() {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    // Skip system volumes
+                    if name == "Macintosh HD" || name.starts_with('.') {
+                        continue;
+                    }
+                    if let Ok(info) = get_device_info_macos(&path) {
+                        devices.push(info);
+                    }
+                }
+            }
+        }
+    }
+
     Ok(devices)
 }
 
@@ -148,8 +168,12 @@ fn is_removable_macos(mount_point: &Path) -> bool {
         .output();
     if let Ok(out) = output {
         let stdout = String::from_utf8_lossy(&out.stdout);
-        // Check for "Device Media Type: Removable Media" or "Protocol: USB"
-        return stdout.contains("Removable Media") || stdout.contains("Protocol:                 USB");
+        // Check for removable indicators — be lenient
+        return stdout.contains("Removable Media")
+            || stdout.contains("Protocol:                 USB")
+            || stdout.contains("Protocol:                USB")
+            || stdout.contains("Removable:               Yes")
+            || stdout.contains("External");
     }
     false
 }
@@ -409,6 +433,276 @@ fn get_space_info(path: &Path) -> (u64, u64) {
     {
         (0, 0) // placeholder; wmic handles it on Windows
     }
+}
+
+// ── File Contiguity Check ──
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContiguityResult {
+    pub file: String,
+    pub contiguous: bool,
+    pub extents: u32,
+    pub size: u64,
+}
+
+/// Check if a file's clusters are physically contiguous on disk.
+/// Returns the number of extents (1 = fully contiguous).
+pub fn check_file_contiguity(path: &Path) -> Result<ContiguityResult, FsError> {
+    let meta = std::fs::metadata(path).map_err(FsError::Io)?;
+    let size = meta.len();
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_default();
+
+    if size == 0 {
+        return Ok(ContiguityResult {
+            file: name,
+            contiguous: true,
+            extents: 1,
+            size,
+        });
+    }
+
+    let extents = get_extent_count(path)?;
+
+    Ok(ContiguityResult {
+        file: name,
+        contiguous: extents == 1,
+        extents,
+        size,
+    })
+}
+
+/// Check contiguity for multiple files in a directory.
+pub fn check_dir_contiguity(dir: &Path, pattern: &str) -> Result<Vec<ContiguityResult>, FsError> {
+    let mut results = Vec::new();
+    for entry in std::fs::read_dir(dir).map_err(FsError::Io)? {
+        let entry = entry.map_err(FsError::Io)?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if pattern.is_empty() || name.starts_with(pattern) {
+            if entry.path().is_file() {
+                results.push(check_file_contiguity(&entry.path())?);
+            }
+        }
+    }
+    Ok(results)
+}
+
+#[cfg(target_os = "macos")]
+fn get_extent_count(path: &Path) -> Result<u32, FsError> {
+    use std::os::unix::io::AsRawFd;
+
+    // ponytail: macOS log2phys struct — not in libc crate, define manually
+    #[repr(C)]
+    struct Log2phys {
+        l2p_flags: i32,
+        l2p_contigbytes: i64,
+        l2p_devoffset: i64,
+    }
+
+    let file = std::fs::File::open(path).map_err(FsError::Io)?;
+    let fd = file.as_raw_fd();
+    let size = file.metadata().map_err(FsError::Io)?.len();
+
+    if size == 0 {
+        return Ok(1);
+    }
+
+    // F_LOG2PHYS gives us l2p_contigbytes: how many bytes are contiguous from this offset.
+    // If it covers the whole file, it's one extent.
+    let mut l2p = Log2phys {
+        l2p_flags: 0,
+        l2p_contigbytes: 0,
+        l2p_devoffset: 0,
+    };
+
+    let ret = unsafe { libc::fcntl(fd, libc::F_LOG2PHYS, &mut l2p) };
+    if ret < 0 {
+        return Err(FsError::DetectionFailed(format!(
+            "fcntl F_LOG2PHYS failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+
+    // l2p_contigbytes = bytes physically contiguous starting at this logical offset
+    if l2p.l2p_contigbytes as u64 >= size {
+        return Ok(1);
+    }
+
+    // File is fragmented — scan to count extents
+    let block_size = 4096u64;
+    let mut extents = 0u32;
+    let mut offset = 0u64;
+    let mut last_dev_end: Option<i64> = None;
+
+    while offset < size {
+        let mut l2p = Log2phys {
+            l2p_flags: 0,
+            l2p_contigbytes: 0,
+            l2p_devoffset: 0,
+        };
+        // ponytail: F_LOG2PHYS_EXT not needed, F_LOG2PHYS works for extent counting
+        let ret = unsafe { libc::fcntl(fd, libc::F_LOG2PHYS, &mut l2p) };
+        if ret < 0 {
+            break;
+        }
+
+        let dev_end = l2p.l2p_devoffset + l2p.l2p_contigbytes;
+        if last_dev_end.map_or(true, |end| l2p.l2p_devoffset != end) {
+            extents += 1;
+        }
+        last_dev_end = Some(dev_end);
+        offset += l2p.l2p_contigbytes.max(block_size as i64) as u64;
+    }
+
+    Ok(extents.max(1))
+}
+
+#[cfg(target_os = "windows")]
+fn get_extent_count(path: &Path) -> Result<u32, FsError> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::FSCTL_GET_RETRIEVAL_POINTERS;
+    use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    #[repr(C)]
+    struct StartingVcnInputBuffer {
+        starting_vcn: i64,
+    }
+
+    #[repr(C)]
+    struct RetrievalPointersBuffer {
+        extent_count: u32,
+        starting_vcn: i64,
+        // Extents array follows, but we only need the count
+    }
+
+    let file = std::fs::File::open(path).map_err(FsError::Io)?;
+    let handle = file.as_raw_handle() as isize;
+
+    let start_vcn = StartingVcnInputBuffer { starting_vcn: 0 };
+    let mut rpb: RetrievalPointersBuffer = unsafe { std::mem::zeroed() };
+    let mut bytes_returned: u32 = 0;
+
+    let ret = unsafe {
+        DeviceIoControl(
+            handle,
+            FSCTL_GET_RETRIEVAL_POINTERS,
+            &start_vcn as *const _ as *const _,
+            std::mem::size_of::<StartingVcnInputBuffer>() as u32,
+            &mut rpb as *mut _ as *mut _,
+            std::mem::size_of::<RetrievalPointersBuffer>() as u32,
+            &mut bytes_returned,
+            std::ptr::null_mut(),
+        )
+    };
+
+    if ret == 0 {
+        let err = std::io::Error::last_os_error();
+        // ERROR_MORE_DATA (234) means buffer too small but extent_count is valid
+        if err.raw_os_error() != Some(234) {
+            return Err(FsError::DetectionFailed(format!(
+                "FSCTL_GET_RETRIEVAL_POINTERS failed: {}",
+                err
+            )));
+        }
+    }
+
+    Ok(rpb.extent_count.max(1))
+}
+
+#[cfg(target_os = "linux")]
+fn get_extent_count(path: &Path) -> Result<u32, FsError> {
+    use std::os::unix::io::AsRawFd;
+
+    // ponytail: fiemap structs not in libc, define manually
+    #[repr(C)]
+    struct FiemapExtent {
+        fe_logical: u64,
+        fe_physical: u64,
+        fe_length: u64,
+        fe_flags: u64,
+        fe_reserved: [u64; 4],
+    }
+
+    #[repr(C)]
+    struct Fiemap {
+        fm_start: u64,
+        fm_length: u64,
+        fm_flags: u32,
+        fm_mapped_extents: u32,
+        fm_extent_count: u32,
+        fm_reserved: u32,
+        fm_extents: *mut FiemapExtent,
+    }
+
+    const FIEMAP: u32 = 0xC020660B;
+
+    let file = std::fs::File::open(path).map_err(FsError::Io)?;
+    let fd = file.as_raw_fd();
+    let size = file.metadata().map_err(FsError::Io)?.len();
+
+    if size == 0 {
+        return Ok(1);
+    }
+
+    let mut extent = FiemapExtent {
+        fe_logical: 0,
+        fe_physical: 0,
+        fe_length: 0,
+        fe_flags: 0,
+        fe_reserved: [0; 4],
+    };
+    let mut fiemap = Fiemap {
+        fm_start: 0,
+        fm_length: size,
+        fm_flags: 0,
+        fm_mapped_extents: 0,
+        fm_extent_count: 1,
+        fm_reserved: 0,
+        fm_extents: &mut extent as *mut FiemapExtent,
+    };
+
+    let ret = unsafe { libc::ioctl(fd, FIEMAP, &mut fiemap) };
+    if ret < 0 {
+        // FIEMAP not supported — fallback to non-contiguous assumption
+        return Ok(2);
+    }
+
+    // If mapped_extents == 1 and covers full file, it's contiguous
+    if fiemap.fm_mapped_extents == 1 && extent.fe_length >= size {
+        return Ok(1);
+    }
+
+    // Count all extents
+    let mut total_extents = 0u32;
+    let mut offset = 0u64;
+    while offset < size {
+        let mut ext = FiemapExtent {
+            fe_logical: 0,
+            fe_physical: 0,
+            fe_length: 0,
+            fe_flags: 0,
+            fe_reserved: [0; 4],
+        };
+        let mut fm = Fiemap {
+            fm_start: offset,
+            fm_length: size - offset,
+            fm_flags: 0,
+            fm_mapped_extents: 0,
+            fm_extent_count: 1,
+            fm_reserved: 0,
+            fm_extents: &mut ext as *mut FiemapExtent,
+        };
+        let r = unsafe { libc::ioctl(fd, FIEMAP, &mut fm) };
+        if r < 0 || fm.fm_mapped_extents == 0 {
+            break;
+        }
+        total_extents += 1;
+        offset = ext.fe_logical + ext.fe_length;
+    }
+
+    Ok(total_extents.max(1))
 }
 
 #[cfg(test)]

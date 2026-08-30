@@ -26,6 +26,8 @@ fn main() {
             commands::delete_game,
             commands::rename_game,
             commands::repair_split_files,
+            commands::check_contiguity,
+            commands::open_folder_dialog,
             commands::get_settings,
             commands::save_settings,
         ])

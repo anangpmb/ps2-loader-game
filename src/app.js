@@ -25,6 +25,7 @@ const App = (() => {
   console.log(`[PS2BT] Mode: ${isTauri ? 'Tauri' : 'Browser'}, invoke: ${!!invoke}, fsUnsupported: ${fsUnsupported}`);
   if (isTauri) {
     console.log('[PS2BT] Tauri dialog available:', !!window.__TAURI__?.dialog);
+    console.log('[PS2BT] Tauri dialog.open:', typeof window.__TAURI__?.dialog?.open);
   }
 
   // ── OPL USBExtreme format helpers (browser mode) ──
@@ -220,6 +221,7 @@ const App = (() => {
           try {
             // Tauri v2 dialog plugin
             const dialog = window.__TAURI__?.dialog;
+            console.log('[PS2BT] Dialog object:', dialog);
             if (dialog && dialog.open) {
               const selected = await dialog.open({
                 directory: true,
@@ -238,7 +240,23 @@ const App = (() => {
                 }];
               }
             } else {
-              log('warn', 'Tauri dialog plugin not available');
+              log('warn', 'Tauri dialog plugin not available — check capabilities config');
+              // Fallback: try using invoke to open dialog
+              try {
+                const selected = await invoke('open_folder_dialog');
+                if (selected) {
+                  return [{
+                    name: selected.split('/').pop() || selected,
+                    filesystem: 'Unknown',
+                    free_space: 0,
+                    total_space: 0,
+                    recommended_mode: 'auto',
+                    mount_point: selected,
+                  }];
+                }
+              } catch (e2) {
+                log('warn', 'Fallback dialog failed: ' + e2.message);
+              }
             }
           } catch (e) {
             log('error', 'Folder picker failed: ' + e.message);
@@ -1148,6 +1166,44 @@ const App = (() => {
       log('success', `Verify: ${result.verified} OK, ${result.errors} errors`);
     });
 
+    $('#btn-check-contiguity').addEventListener('click', async () => {
+      if (!state.device?.mount_point) {
+        toast('error', 'Select a target drive first');
+        return;
+      }
+      log('info', 'Checking file contiguity...');
+      try {
+        if (invoke) {
+          const results = await invoke('check_contiguity', { destDir: state.device.mount_point });
+          if (results.length === 0) {
+            log('warn', 'No ul.* files found on device');
+            toast('info', 'No split files found');
+            return;
+          }
+          let fragmented = 0;
+          for (const r of results) {
+            if (r.contiguous) {
+              log('success', `OK: ${r.file} — 1 extent, ${formatBytes(r.size)}`);
+            } else {
+              log('error', `FRAGMENTED: ${r.file} — ${r.extents} extents, ${formatBytes(r.size)}`);
+              fragmented++;
+            }
+          }
+          if (fragmented === 0) {
+            toast('success', `All ${results.length} file(s) contiguous`);
+          } else {
+            toast('error', `${fragmented}/${results.length} file(s) fragmented — run defrag`);
+          }
+        } else {
+          log('warn', 'Contiguity check requires native mode (Tauri)');
+          toast('info', 'Not available in browser mode');
+        }
+      } catch (e) {
+        log('error', 'Contiguity check failed: ' + e.message);
+        toast('error', e.message);
+      }
+    });
+
     document.addEventListener('keydown', e => {
       if (e.key === 'Escape') $$('.modal-overlay--active').forEach(m => m.classList.remove('modal-overlay--active'));
     });
@@ -1159,6 +1215,8 @@ const App = (() => {
     // The device button differs per mode: native rescans connected drives,
     // browser opens a folder picker. Label/icon reflect that.
     const deviceBtn = $('#btn-refresh-device');
+    console.log('[PS2BT] init: isTauri=', isTauri, 'fsUnsupported=', fsUnsupported, 'deviceBtn=', !!deviceBtn);
+    
     if (deviceBtn) {
       deviceBtn.title = isTauri
         ? 'Rescan drives or select folder'
@@ -1173,7 +1231,10 @@ const App = (() => {
     // cannot write to a drive at all — surface a persistent, actionable notice
     // instead of a button that silently does nothing.
     if (fsUnsupported) {
+      console.log('[PS2BT] fsUnsupported=true, disabling button');
       showBrowserSupportNote(deviceBtn);
+    } else {
+      console.log('[PS2BT] fsUnsupported=false, button should be enabled');
     }
 
     refreshDevice();

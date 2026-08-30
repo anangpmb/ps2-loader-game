@@ -310,6 +310,32 @@ pub struct VerifyResult {
     pub errors: usize,
 }
 
+/// Check contiguity of ul.* split files on the device.
+/// Returns a list of results for each file found.
+#[tauri::command]
+pub fn check_contiguity(dest_dir: String) -> Result<Vec<filesystem::ContiguityResult>, String> {
+    let dest_path = PathBuf::from(&dest_dir);
+    filesystem::check_dir_contiguity(&dest_path, "ul.")
+        .map_err(|e| e.to_string())
+}
+
+/// Open a native folder picker dialog and return the selected path.
+/// Fallback for when the JS dialog API isn't working.
+#[tauri::command]
+pub async fn open_folder_dialog(app: tauri::AppHandle) -> Result<Option<String>, String> {
+    use tauri_plugin_dialog::DialogExt;
+    
+    let path = app.dialog()
+        .file()
+        .set_title("Select USB Drive or Folder")
+        .blocking_pick_folder();
+    
+    match path {
+        Some(p) => Ok(Some(p.to_string())),
+        None => Ok(None),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GameEntry {
     pub game_id: String,
