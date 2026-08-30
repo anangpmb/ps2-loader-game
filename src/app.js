@@ -430,6 +430,12 @@ const App = (() => {
       const existingEntries = await readUlcfgEntries();
       const existingMap = new Map(existingEntries.map(e => [e.gameId, e]));
       
+      // CRC → title map from existing entries for fallback matching
+      const existingByCrc = new Map();
+      for (const e of existingEntries) {
+        existingByCrc.set(Opl.hex(e.title), e.title);
+      }
+      
       const entries = [];
       const seen = new Set();
       for await (const [name, handle] of destDirHandle.entries()) {
@@ -444,7 +450,14 @@ const App = (() => {
         }
         // Preserve existing title if available, otherwise use gameId
         const existing = existingMap.get(p.gameId);
-        let title = existing ? existing.title : p.gameId;
+        let title;
+        if (existing) {
+          title = existing.title;
+        } else if (existingByCrc.has(p.crc)) {
+          title = existingByCrc.get(p.crc);
+        } else {
+          title = p.gameId;
+        }
         const media = existing ? existing.media : 0x14;
         
         // Detect if title is actually a gameId (fallback placeholder)

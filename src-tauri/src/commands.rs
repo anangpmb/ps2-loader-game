@@ -219,6 +219,13 @@ pub fn generate_ulcfg(dest_dir: String) -> Result<usize, String> {
         .map(|e| (e.game_id.clone(), e))
         .collect();
 
+    // CRC → title map from existing entries for fallback matching.
+    // ponytail: handles case where ul.cfg game_id is wrong but title is correct.
+    let existing_by_crc: BTreeMap<String, String> = existing
+        .values()
+        .map(|e| (opl_crc::crc32_hex(&e.title), e.title.clone()))
+        .collect();
+
     // Group chunk files on disk by game id.
     // value: (crc, parts count, total size)
     let mut groups: BTreeMap<String, (String, u16, u64)> = BTreeMap::new();
@@ -235,24 +242,28 @@ pub fn generate_ulcfg(dest_dir: String) -> Result<usize, String> {
     }
 
     let mut entries = Vec::new();
-    for (game_id, (_crc, parts, total)) in groups {
-        if let Some(prev) = existing.get(&game_id) {
-            entries.push(UlEntry {
-                title: prev.title.clone(),
-                game_id,
-                parts,
-                media: prev.media,
-                mount_point: dest_dir.clone(),
-            });
+    for (game_id, (crc, parts, total)) in groups {
+        let title = if let Some(prev) = existing.get(&game_id) {
+            prev.title.clone()
+        } else if let Some(title) = existing_by_crc.get(&crc) {
+            // Fallback: match by CRC from chunk filename when game_id in ul.cfg is wrong.
+            title.clone()
         } else {
-            entries.push(UlEntry {
-                title: game_id.clone(),
-                game_id,
-                parts,
-                media: detect_media(total),
-                mount_point: dest_dir.clone(),
-            });
-        }
+            game_id.clone()
+        };
+
+        let media = existing
+            .get(&game_id)
+            .map(|e| e.media)
+            .unwrap_or_else(|| detect_media(total));
+
+        entries.push(UlEntry {
+            title,
+            game_id,
+            parts,
+            media,
+            mount_point: dest_dir.clone(),
+        });
     }
 
     let count = entries.len();
