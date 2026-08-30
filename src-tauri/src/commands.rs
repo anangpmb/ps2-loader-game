@@ -54,7 +54,13 @@ impl AppSettings {
 /// Heuristic media type for the `ul.cfg` entry: CD for small (<= 700 MiB)
 /// images, DVD otherwise. The exact disc type is not always recoverable from an
 /// ISO, and this matches how the vast majority of PS2 titles are distributed.
+///
+/// ponytail: 700MB threshold — some CD games are larger, but DVD is safer default.
+/// If a CD game is misdetected as DVD, OPL may still work. Wrong CD detection
+/// for a DVD game causes white screen.
 fn detect_media(size: u64) -> u8 {
+    // Single-layer DVD capacity ~4.37 GB
+    // Games <= 700MB are likely CD, everything else is DVD
     if size <= 700 * 1024 * 1024 {
         ulcfg::MEDIA_CD
     } else {

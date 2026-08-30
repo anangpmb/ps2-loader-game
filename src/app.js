@@ -9,6 +9,7 @@ const App = (() => {
       checksum: 'crc32',
       maxRetries: 3,
       splitMode: 'auto',
+      sortBySize: true, // Auto-sort largest first for FAT32 contiguity
     },
     device: null,
     processing: false,
@@ -696,7 +697,14 @@ const App = (() => {
     state.processing = true;
     updateStats();
 
-    const pending = state.queue.filter(i => i.status === 'pending');
+    let pending = state.queue.filter(i => i.status === 'pending');
+    
+    // Auto-sort by size descending (largest first) to minimize FAT32 fragmentation
+    if (state.settings.sortBySize !== false) {
+      pending.sort((a, b) => b.size - a.size);
+      log('info', `Sorted by size (largest first) to minimize fragmentation`);
+    }
+    
     log('info', `Starting batch: ${pending.length} game(s)`);
 
     for (const item of pending) {
@@ -1131,6 +1139,7 @@ const App = (() => {
       $('#setting-checksum').value = state.settings.checksum;
       $('#setting-retries').value = state.settings.maxRetries;
       $('#setting-split-mode').value = state.settings.splitMode;
+      $('#setting-sort-by-size').checked = state.settings.sortBySize !== false;
       $('#modal-settings').classList.add('modal-overlay--active');
     });
     $$('[data-close]').forEach(el => {
@@ -1141,10 +1150,11 @@ const App = (() => {
       state.settings.checksum = $('#setting-checksum').value;
       state.settings.maxRetries = parseInt($('#setting-retries').value);
       state.settings.splitMode = $('#setting-split-mode').value;
+      state.settings.sortBySize = $('#setting-sort-by-size').checked;
       localStorage.setItem('ps2bt-settings', JSON.stringify(state.settings));
       $('#modal-settings').classList.remove('modal-overlay--active');
       toast('success', 'Settings saved');
-      log('info', `Settings: buffer=${state.settings.bufferSize}MB checksum=${state.settings.checksum} retries=${state.settings.maxRetries} mode=${state.settings.splitMode}`);
+      log('info', `Settings: buffer=${state.settings.bufferSize}MB checksum=${state.settings.checksum} retries=${state.settings.maxRetries} mode=${state.settings.splitMode} sortBySize=${state.settings.sortBySize}`);
       if (state.device) updateDeviceDisplay(state.device);
     });
 
