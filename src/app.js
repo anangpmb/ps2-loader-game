@@ -131,48 +131,39 @@ const App = (() => {
     return entries;
   }
   async function readUlcfgEntries() {
-    try {
-      const handle = await destDirHandle.getFileHandle('ul.cfg');
-      const file = await handle.getFile();
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      return parseUlcfg(bytes);
-    } catch (e) {
-      // Try fallback
+    const targets = ['ul.cfg', 'ul.cfg.bak'];
+    for (const name of targets) {
       try {
-        const handle = await destDirHandle.getFileHandle('ul.cfg.bak');
+        log('info', `Trying to read: "${name}"`);
+        const handle = await destDirHandle.getFileHandle(name);
         const file = await handle.getFile();
         const bytes = new Uint8Array(await file.arrayBuffer());
+        log('info', `${name} loaded: ${bytes.length} bytes`);
         return parseUlcfg(bytes);
-      } catch (e2) {
-        return [];
+      } catch (e) {
+        log('warn', `Read "${name}" failed: ${e.name}: ${e.message}`);
       }
     }
+    return [];
   }
   async function writeUlcfgEntries(entries) {
     if (!destDirHandle) throw new Error('No destination folder selected');
     const data = encodeUlcfg(entries);
     log('info', `Writing ul.cfg: ${entries.length} entries, ${data.length} bytes`);
 
-    try {
-      const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
-      const w = await handle.createWritable();
-      await w.write(data);
-      await w.close();
-      log('info', `ul.cfg successfully updated: ${entries.length} entries`);
-      return;
-    } catch (e) {
-      log('warn', `Primary ul.cfg write failed: ${e.name}: ${e.message}`);
-    }
-
-    try {
-      const handle = await destDirHandle.getFileHandle('ul.cfg.bak', { create: true });
-      const w = await handle.createWritable();
-      await w.write(data);
-      await w.close();
-      log('info', `ul.cfg.bak updated as fallback: ${entries.length} entries`);
-      return;
-    } catch (e) {
-      log('error', `Fallback write failed: ${e.name}: ${e.message}`);
+    const targets = ['ul.cfg', 'ul.cfg.bak'];
+    for (const name of targets) {
+      try {
+        log('info', `Trying to write: "${name}"`);
+        const handle = await destDirHandle.getFileHandle(name, { create: true });
+        const w = await handle.createWritable();
+        await w.write(data);
+        await w.close();
+        log('info', `${name} successfully updated: ${entries.length} entries`);
+        return;
+      } catch (e) {
+        log('error', `Write to "${name}" failed: ${e.name}: ${e.message}`);
+      }
     }
 
     throw new Error('Failed to write ul.cfg. Check drive permissions or write-protection switch.');
