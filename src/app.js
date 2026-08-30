@@ -83,6 +83,7 @@ const App = (() => {
 
   // ── Binary ul.cfg (64-byte records) ──
   function ulWriteAscii(buf, off, str, maxLen) {
+    if (!str) return;
     const n = Math.min(str.length, maxLen);
     for (let i = 0; i < n; i++) buf[off + i] = str.charCodeAt(i) & 0xFF;
   }
@@ -95,8 +96,9 @@ const App = (() => {
     return cleaned.length > 0 ? cleaned : "UNKNOWN_GAME";
   }
   function encodeUlcfg(entries) {
-    const buf = new Uint8Array(entries.length * UL_ENTRY_SIZE);
-    entries.forEach((e, i) => {
+    const validEntries = entries.filter(e => e.title && e.gameId);
+    const buf = new Uint8Array(validEntries.length * UL_ENTRY_SIZE);
+    validEntries.forEach((e, i) => {
       const off = i * UL_ENTRY_SIZE;
       ulWriteAscii(buf, off, e.title, 31);
       ulWriteAscii(buf, off + 0x20, 'ul.' + e.gameId, 14);
@@ -120,6 +122,15 @@ const App = (() => {
   }
   async function readUlcfgEntries() {
     try {
+      // Check if ul.cfg exists first
+      let hasUlcfg = false;
+      for await (const [name] of destDirHandle.entries()) {
+        if (name === 'ul.cfg') { hasUlcfg = true; break; }
+      }
+      if (!hasUlcfg) {
+        console.log('[ul.cfg] file not found in', destDirHandle.name);
+        return [];
+      }
       const handle = await destDirHandle.getFileHandle('ul.cfg');
       const file = await handle.getFile();
       const bytes = new Uint8Array(await file.arrayBuffer());
@@ -129,7 +140,7 @@ const App = (() => {
       if (entries.length > 0) console.log('[ul.cfg] first entry:', entries[0]);
       return entries;
     } catch (e) {
-      console.error('[ul.cfg] read error:', e);
+      console.error('[ul.cfg] read error:', e.message);
       return [];
     }
   }
