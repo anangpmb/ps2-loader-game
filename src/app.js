@@ -22,7 +22,10 @@ const App = (() => {
   // True when running in a browser that lacks the File System Access API
   // (macOS Safari, Firefox) — drive writing is impossible there.
   const fsUnsupported = !isTauri && typeof window.showDirectoryPicker !== 'function';
-  console.log(`[PS2BT] Mode: ${isTauri ? 'Tauri' : 'Browser'}, invoke: ${!!invoke}`);
+  console.log(`[PS2BT] Mode: ${isTauri ? 'Tauri' : 'Browser'}, invoke: ${!!invoke}, fsUnsupported: ${fsUnsupported}`);
+  if (isTauri) {
+    console.log('[PS2BT] Tauri dialog available:', !!window.__TAURI__?.dialog);
+  }
 
   // ── OPL USBExtreme format helpers (browser mode) ──
   // Mirror of the Rust backend (opl_crc.rs / ulcfg.rs / split.rs) so drives
@@ -205,7 +208,44 @@ const App = (() => {
   const Tauri = {
     async listDevices({ interactive = false } = {}) {
       if (invoke) {
-        return invoke('list_devices');
+        try {
+          const devices = await invoke('list_devices');
+          if (devices.length > 0) return devices;
+        } catch (e) {
+          log('warn', 'Auto-detect failed: ' + e.message);
+        }
+        
+        // If interactive and no devices found, offer folder picker
+        if (interactive) {
+          try {
+            // Tauri v2 dialog plugin
+            const dialog = window.__TAURI__?.dialog;
+            if (dialog && dialog.open) {
+              const selected = await dialog.open({
+                directory: true,
+                multiple: false,
+                title: 'Select USB Drive or Folder',
+              });
+              if (selected) {
+                log('info', 'Selected folder: ' + selected);
+                return [{
+                  name: selected.split('/').pop() || selected.split('\\').pop() || selected,
+                  filesystem: 'Unknown',
+                  free_space: 0,
+                  total_space: 0,
+                  recommended_mode: 'auto',
+                  mount_point: selected,
+                }];
+              }
+            } else {
+              log('warn', 'Tauri dialog plugin not available');
+            }
+          } catch (e) {
+            log('error', 'Folder picker failed: ' + e.message);
+          }
+        }
+        
+        return [];
       }
       // Browser mode: a "device" is a folder the user grants access to.
       const asDevice = async () => {
@@ -877,6 +917,30 @@ const App = (() => {
         await invoke('rename_game', { destDir: state.device.mount_point, gameId, mode, location, newTitle });
       } else {
         if (mode === 'split') {
+          // Rename chunk files: ul.<oldCRC>.<gameId>.<part> → ul.<newCRC>.<gameId>.<part>
+          const oldCrc = Opl.hex(oldTitle);
+          const newCrc = Opl.hex(newTitle);
+          if (oldCrc !== newCrc) {
+            const toRename = [];
+            for await (const [name, handle] of destDirHandle.entries()) {
+              const p = parseChunkName(name);
+              if (p && p.gameId === gameId && p.crc === oldCrc) {
+                toRename.push({ oldName: name, part: p.part });
+              }
+            }
+            for (const { oldName, part } of toRename) {
+              const newName = chunkName(newCrc, gameId, parseInt(part, 16));
+              const file = await destDirHandle.getFileHandle(oldName);
+              const data = await file.getFile();
+              const newHandle = await destDirHandle.getFileHandle(newName, { create: true });
+              const w = await newHandle.createWritable();
+              await w.write(data);
+              await w.close();
+              await destDirHandle.removeEntry(oldName);
+            }
+            log('info', `Renamed ${toRename.length} chunk files: CRC ${oldCrc} → ${newCrc}`);
+          }
+          // Update ul.cfg
           const entries = await readUlcfgEntries();
           const entry = entries.find(e => e.gameId === gameId);
           if (entry) entry.title = newTitle;
@@ -948,7 +1012,12 @@ const App = (() => {
 
     // Split games from ul.cfg (grouped, real titles).
     for (const e of await readUlcfgEntries()) {
-      const g = chunkGroups[e.gameId] || { size: 0, parts: e.parts };
+      const g = chunkGroups[e.gameId];
+      // Skip ul.cfg entry if chunk files don't exist (size 0)
+      if (!g || g.size === 0) {
+        log('info', `Skipping ${e.gameId}: no chunk files found`);
+        continue;
+      }
       games.push({
         game_id: e.gameId, title: e.title, parts: e.parts,
         size: g.size, location: 'root', mode: 'split',
@@ -972,6 +1041,7 @@ const App = (() => {
         for await (const [name, handle] of dirHandle.entries()) {
           if (handle.kind === 'file' && name.endsWith('.iso')) {
             const gameId = name.replace(/\.iso$/, '');
+            if (known.has(gameId)) continue; // Skip if already in ul.cfg
             games.push({
               game_id: gameId,
               title: gameId,
@@ -1078,11 +1148,11 @@ const App = (() => {
     const deviceBtn = $('#btn-refresh-device');
     if (deviceBtn) {
       deviceBtn.title = isTauri
-        ? 'Rescan connected drives'
+        ? 'Rescan drives or select folder'
         : 'Choose the USB drive / folder to write games to';
       if (isTauri) {
         deviceBtn.innerHTML =
-          '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Refresh';
+          '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg> Select Drive';
       }
     }
 
@@ -1098,8 +1168,16 @@ const App = (() => {
     if (isTauri) {
       log('info', 'Running in Tauri mode (native)');
     } else if (fsUnsupported) {
-      log('warn', 'This browser lacks the File System Access API — use Chrome/Edge or the desktop app to write to a drive');
+      log('warn', 'This browser lacks the File System Access API — use Chrome/Edge or the desktop app');
     } else {
+      // Warn about browser compatibility
+      const isBrave = navigator.brave && navigator.brave.isBrave;
+      const isWindows = navigator.platform.includes('Win');
+      if (isBrave) {
+        log('warn', 'Brave browser detected — File System Access API may have issues on Windows. Use Chrome/Edge for best compatibility.');
+      } else if (isWindows) {
+        log('info', 'Windows detected — if you encounter "Name is not allowed" errors, try Chrome/Edge instead of Brave.');
+      }
       log('info', 'Running in browser mode — click "Select Drive" to grant folder access');
     }
   }

@@ -454,7 +454,7 @@ pub fn delete_game(
     Ok(())
 }
 
-/// Rename a game title (metadata only — updates ul.cfg, no file rename).
+/// Rename a game title — updates ul.cfg AND renames chunk files so the CRC stays consistent.
 #[tauri::command]
 pub fn rename_game(
     dest_dir: String,
@@ -470,8 +470,10 @@ pub fn rename_game(
     }
     let mut entries = ulcfg::parse_ulcfg(&ulcfg_path).map_err(|e| e.to_string())?;
     let mut found = false;
+    let mut old_title = String::new();
     for entry in &mut entries {
         if entry.game_id == game_id {
+            old_title = entry.title.clone();
             entry.title = new_title.clone();
             found = true;
         }
@@ -479,6 +481,29 @@ pub fn rename_game(
     if !found {
         return Err(format!("Game {} not found in ul.cfg", game_id));
     }
+
+    // Rename chunk files: ul.<oldCRC>.<gameId>.<part> → ul.<newCRC>.<gameId>.<part>
+    let old_crc = opl_crc::crc32_hex(&old_title);
+    let new_crc = opl_crc::crc32_hex(&new_title);
+    if old_crc != new_crc {
+        if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
+            for entry in read_dir.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if let Some((crc, id, part)) = parse_chunk_name(&name) {
+                    if id == game_id && crc == old_crc {
+                        let new_name = split::chunk_file_name(&new_crc, &game_id, part.parse::<u32>().unwrap_or(0));
+                        let old_path = entry.path();
+                        let new_path = dest_path.join(&new_name);
+                        if !new_path.exists() {
+                            std::fs::rename(&old_path, &new_path)
+                                .map_err(|e| format!("Failed to rename {}: {}", name, e))?;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     ulcfg::write_ulcfg(&ulcfg_path, &entries).map_err(|e| e.to_string())?;
     Ok(())
 }
