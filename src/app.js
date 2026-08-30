@@ -192,7 +192,8 @@ const App = (() => {
         format = 'ISO9660';
       }
       const valid = format !== null;
-      const gameId = await readGameIdFromFile(file) || file.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_');
+      const rawGameId = await readGameIdFromFile(file) || file.name.replace(/\.[^.]+$/, '');
+      const gameId = rawGameId.replace(/[^a-zA-Z0-9_.]/g, '_');
       return {
         valid,
         size: file.size,
@@ -219,8 +220,11 @@ const App = (() => {
       // Extract real metadata from ISO header
       const isoTitle = await readIsoTitleFromFile(queueItem.file) || queueItem.name.replace(/\.[^.]+$/, '');
       const isoGameId = await readGameIdFromFile(queueItem.file);
-      const gameId = isoGameId || queueItem.gameId || queueItem.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_.]/g, '_');
+      const rawGameId = isoGameId || queueItem.gameId || queueItem.name.replace(/\.[^.]+$/, '');
+      // Sanitize gameId: keep dots, underscores, alphanum only (safe for filenames)
+      const gameId = rawGameId.replace(/[^a-zA-Z0-9_.]/g, '_');
       const title = isoTitle;
+      log('info', `ISO metadata: title="${title}" gameId="${gameId}" (raw="${rawGameId}")`);
       const fileSize = queueItem.file.size;
       const isSplit = queueItem.mode === 'split';
       const CHUNK_SIZE = 1073741824; // 1 GiB — matches OPL / backend
@@ -807,19 +811,15 @@ const App = (() => {
     try {
       const SEARCH_SIZE = Math.min(4 * 1024 * 1024, file.size);
       const buf = await file.slice(0, SEARCH_SIZE).arrayBuffer();
-      const text = new TextDecoder().decode(new Uint8Array(buf));
-      for (const line of text.split(/\r?\n/)) {
-        const trimmed = line.trim();
-        if (trimmed.includes('BOOT2') && trimmed.includes('cdrom0:')) {
-          const slashIdx = trimmed.indexOf('\\');
-          if (slashIdx === -1) continue;
-          const afterSlash = trimmed.slice(slashIdx + 1);
-          const semiIdx = afterSlash.indexOf(';');
-          if (semiIdx === -1) continue;
-          const id = afterSlash.slice(0, semiIdx).trim();
-          if (id) return id; // e.g. "SLUS_200.00"
-        }
+      const text = new TextDecoder('ascii').decode(new Uint8Array(buf));
+      
+      // Search for BOOT2 pattern directly in text (more robust than line splitting)
+      const boot2Match = text.match(/BOOT2\s*=\s*cdrom0:\\([^;]+)/);
+      if (boot2Match) {
+        const id = boot2Match[1].trim();
+        if (id) return id.replace(/[^a-zA-Z0-9_.]/g, '_'); // sanitize for filename safety
       }
+      
       return null;
     } catch { return null; }
   }
