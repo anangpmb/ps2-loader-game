@@ -119,9 +119,12 @@ pub fn write_ulcfg(path: &Path, entries: &[UlEntry]) -> Result<(), UlCfgError> {
 fn encode_entry(entry: &UlEntry) -> [u8; ENTRY_SIZE] {
     let mut buf = [0u8; ENTRY_SIZE];
 
-    // Name (32 bytes, null-padded)
+    // Name (32 bytes, null-padded). Allow up to 32 chars — the field has no
+    // explicit null terminator when the name fills all 32 bytes, but OPL copies
+    // the field into a 33-byte buffer (zeroed at index 32) before hashing, so a
+    // full-width name is still terminated correctly.
     let name_bytes = entry.title.as_bytes();
-    let name_len = name_bytes.len().min(NAME_SIZE - 1);
+    let name_len = name_bytes.len().min(NAME_SIZE);
     buf[..name_len].copy_from_slice(&name_bytes[..name_len]);
 
     // Image: "ul." + game id (15 bytes, null-padded)

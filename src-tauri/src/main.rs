@@ -18,6 +18,7 @@ fn main() {
         .invoke_handler(tauri::generate_handler![
             commands::detect_device,
             commands::list_devices,
+            commands::get_device_info_for_path,
             commands::validate_iso,
             commands::process_iso,
             commands::generate_ulcfg,
@@ -25,8 +26,10 @@ fn main() {
             commands::list_device_games,
             commands::delete_game,
             commands::rename_game,
+            commands::sort_ulcfg,
             commands::repair_split_files,
             commands::check_contiguity,
+            commands::defrag_split_files,
             commands::open_folder_dialog,
             commands::format_drive_for_opl,
             commands::get_settings,

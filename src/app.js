@@ -85,7 +85,23 @@ const App = (() => {
     return { crc, gameId, part };
   }
 
-  function mediaForSize(size) { return size <= 700 * 1024 * 1024 ? 0x12 : 0x14; }
+  // Detect CD (0x12) vs DVD (0x14).
+  // Reads the UDF Volume Recognition Sequence at sector 256 (offset 0x80000):
+  // PS2 DVD games carry "BEA01" there; CD-only titles do not.
+  // Falls back to size (> 700 MiB = DVD) when the sector is unreadable.
+  async function detectMediaType(file) {
+    const UDF_OFFSET = 256 * 2048; // 0x80000
+    if (file && file.size > UDF_OFFSET + 5) {
+      try {
+        const slice = file.slice(UDF_OFFSET, UDF_OFFSET + 5);
+        const arr = new Uint8Array(await slice.arrayBuffer());
+        if (arr[0] === 0x42 && arr[1] === 0x45 && arr[2] === 0x41 && arr[3] === 0x30 && arr[4] === 0x31) {
+          return 0x14; // "BEA01" → DVD
+        }
+      } catch {}
+    }
+    return file && file.size > 700 * 1024 * 1024 ? 0x14 : 0x12;
+  }
 
   // ── Binary ul.cfg (64-byte records) ──
   function ulWriteAscii(buf, off, str, maxLen) {
@@ -106,7 +122,7 @@ const App = (() => {
     const buf = new Uint8Array(validEntries.length * UL_ENTRY_SIZE);
     validEntries.forEach((e, i) => {
       const off = i * UL_ENTRY_SIZE;
-      ulWriteAscii(buf, off, e.title, 31);
+      ulWriteAscii(buf, off, e.title, 32);
       ulWriteAscii(buf, off + 0x20, 'ul.' + e.gameId, 14);
       buf[off + 0x2F] = Math.min(e.parts || 1, 255) & 0xFF;
       buf[off + 0x30] = e.media === 0x12 ? 0x12 : 0x14;
@@ -231,6 +247,12 @@ const App = (() => {
               });
               if (selected) {
                 log('info', 'Selected folder: ' + selected);
+                try {
+                  const info = await invoke('get_device_info_for_path', { path: selected });
+                  return [{ ...info, mount_point: selected, is_removable: true }];
+                } catch (e2) {
+                  log('warn', 'Could not read device info: ' + e2.message);
+                }
                 return [{
                   name: selected.split('/').pop() || selected.split('\\').pop() || selected,
                   filesystem: 'Unknown',
@@ -246,6 +268,10 @@ const App = (() => {
               try {
                 const selected = await invoke('open_folder_dialog');
                 if (selected) {
+                  try {
+                    const info = await invoke('get_device_info_for_path', { path: selected });
+                    return [{ ...info, mount_point: selected, is_removable: true }];
+                  } catch {}
                   return [{
                     name: selected.split('/').pop() || selected,
                     filesystem: 'Unknown',
@@ -358,7 +384,7 @@ const App = (() => {
       const fileSize = queueItem.file.size;
       const isSplit = queueItem.mode === 'split';
       const CHUNK_SIZE = 1073741824; // 1 GiB — matches OPL / backend
-      const media = mediaForSize(fileSize);
+      const media = await detectMediaType(queueItem.file);
       const crcHex = Opl.hex(title);
 
       if (!isSplit) {
@@ -1132,7 +1158,18 @@ const App = (() => {
     });
 
     $('#btn-refresh-games').addEventListener('click', refreshDeviceGames);
-    $('#sort-games').addEventListener('change', renderDeviceGames);
+    $('#sort-games').addEventListener('change', async () => {
+      renderDeviceGames();
+      if (invoke && state.device?.mount_point) {
+        const sortBy = $('#sort-games').value;
+        try {
+          const n = await invoke('sort_ulcfg', { destDir: state.device.mount_point, sortBy });
+          log('info', `ul.cfg sorted by "${sortBy}" (${n} entries)`);
+        } catch (e) {
+          log('warn', 'Could not sort ul.cfg: ' + e.message);
+        }
+      }
+    });
 
     $('#btn-settings').addEventListener('click', () => {
       $('#setting-buffer').value = state.settings.bufferSize;
@@ -1211,6 +1248,41 @@ const App = (() => {
       } catch (e) {
         log('error', 'Contiguity check failed: ' + e.message);
         toast('error', e.message);
+      }
+    });
+
+    $('#btn-defrag').addEventListener('click', async () => {
+      if (!state.device?.mount_point) {
+        toast('error', 'Select a target drive first');
+        return;
+      }
+      if (!invoke) {
+        log('warn', 'Defrag requires native mode (Tauri)');
+        toast('info', 'Not available in browser mode');
+        return;
+      }
+      log('info', 'Rewriting fragmented split files (best-effort, not guaranteed) — this may take several minutes...');
+      const btn = $('#btn-defrag');
+      btn.disabled = true;
+      try {
+        const result = await invoke('defrag_split_files', { destDir: state.device.mount_point });
+        if (result.defragged === 0 && result.skipped === 0) {
+          toast('success', 'All split files are already contiguous');
+          log('success', 'Defrag: nothing to do — all files contiguous');
+        } else {
+          const moved = formatBytes(result.bytes_moved);
+          toast('success', `Defrag: ${result.defragged} file(s) defragged, ${moved} rewritten`);
+          log('success', `Defrag: ${result.defragged} defragged, ${result.skipped} skipped, ${moved} moved`);
+        }
+        for (const err of (result.errors || [])) {
+          log('error', `Defrag error: ${err}`);
+        }
+        if (result.defragged > 0) refreshDeviceGames();
+      } catch (e) {
+        log('error', 'Defrag failed: ' + e.message);
+        toast('error', 'Defrag failed: ' + e.message);
+      } finally {
+        btn.disabled = false;
       }
     });
 

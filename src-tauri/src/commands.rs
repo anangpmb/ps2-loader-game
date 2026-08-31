@@ -51,16 +51,10 @@ impl AppSettings {
     }
 }
 
-/// Heuristic media type for the `ul.cfg` entry: CD for small (<= 700 MiB)
-/// images, DVD otherwise. The exact disc type is not always recoverable from an
-/// ISO, and this matches how the vast majority of PS2 titles are distributed.
-///
-/// ponytail: 700MB threshold — some CD games are larger, but DVD is safer default.
-/// If a CD game is misdetected as DVD, OPL may still work. Wrong CD detection
-/// for a DVD game causes white screen.
+/// Size-only media type fallback used when the source ISO is not available
+/// (migration, ul.cfg recovery). Prefer `iso::detect_media_type` when the ISO
+/// path is known — it reads the UDF marker and is accurate for small DVD games.
 fn detect_media(size: u64) -> u8 {
-    // Single-layer DVD capacity ~4.37 GB
-    // Games <= 700MB are likely CD, everything else is DVD
     if size <= 700 * 1024 * 1024 {
         ulcfg::MEDIA_CD
     } else {
@@ -112,6 +106,12 @@ pub fn detect_device() -> Result<DeviceInfo, String> {
 #[tauri::command]
 pub fn list_devices() -> Result<Vec<DeviceInfo>, String> {
     filesystem::detect_devices().map_err(|e| e.to_string())
+}
+
+/// Get device info (filesystem type, free/total space) for a manually selected path.
+#[tauri::command]
+pub fn get_device_info_for_path(path: String) -> Result<DeviceInfo, String> {
+    filesystem::get_device_info(std::path::Path::new(&path)).map_err(|e| e.to_string())
 }
 
 /// Validate a PS2 ISO file.
@@ -196,7 +196,8 @@ pub async fn process_iso(
             title,
             game_id,
             parts: result.chunks.len() as u16,
-            media: detect_media(file_size),
+            // Read media type from ISO (UDF check), not just from file size.
+            media: iso::detect_media_type(&source_path),
             mount_point: dest_dir,
         };
         ulcfg::add_entry(&ulcfg_path, &entry).map_err(|e| e.to_string())?;
@@ -323,6 +324,116 @@ pub fn check_contiguity(dest_dir: String) -> Result<Vec<filesystem::ContiguityRe
     let dest_path = PathBuf::from(&dest_dir);
     filesystem::check_dir_contiguity(&dest_path, "ul.")
         .map_err(|e| e.to_string())
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct DefragResult {
+    pub defragged: u32,
+    pub skipped: u32,
+    pub bytes_moved: u64,
+    pub errors: Vec<String>,
+}
+
+/// Attempt to reduce fragmentation of split game files (`ul.*`) on the device.
+///
+/// **Limitation**: this is NOT true defragmentation. True defrag requires
+/// kernel-level `FSCTL_MOVE_FILE` (Windows) or equivalent, which demands
+/// administrator privileges and a volume handle. This command uses a
+/// copy-delete-copy approach instead: it only produces contiguous files when
+/// the free space that opens up after deletion is itself contiguous. If the
+/// drive's free space is fragmented the rewritten file may still be fragmented.
+///
+/// For a guaranteed result: copy all games off the drive, use "Format for OPL"
+/// to start fresh, then re-add the ISOs (fresh allocation is always contiguous).
+///
+/// Process per fragmented file:
+///   1. Copy to a temp file in the OS temp directory.
+///   2. Delete the original (releases the scattered FAT32 clusters).
+///   3. Copy the temp file back to the original path (new cluster allocation).
+///   4. Delete the temp file.
+///
+/// If step 3 fails the temp copy is left in place to avoid data loss;
+/// its path is reported in `errors` so the user can recover manually.
+/// Peak extra disk usage = size of the largest single chunk (≤ 1 GiB).
+#[tauri::command]
+pub async fn defrag_split_files(dest_dir: String) -> Result<DefragResult, String> {
+    let dest_path = PathBuf::from(&dest_dir);
+    tokio::task::spawn_blocking(move || defrag_impl(&dest_path))
+        .await
+        .map_err(|e| format!("Task join failed: {}", e))?
+}
+
+fn defrag_impl(dest_path: &std::path::Path) -> Result<DefragResult, String> {
+    let mut defragged = 0u32;
+    let mut skipped = 0u32;
+    let mut bytes_moved = 0u64;
+    let mut errors: Vec<String> = Vec::new();
+    let temp_dir = std::env::temp_dir();
+
+    // Collect fragmented ul.* chunk files (not ul.cfg).
+    let mut fragmented: Vec<(std::path::PathBuf, u64)> = Vec::new();
+    let rd = std::fs::read_dir(dest_path).map_err(|e| e.to_string())?;
+    for entry in rd.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("ul.") || name == "ul.cfg" {
+            continue;
+        }
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        match filesystem::check_file_contiguity(&path) {
+            Ok(c) if !c.contiguous => fragmented.push((path, c.size)),
+            _ => {}
+        }
+    }
+
+    for (path, size) in fragmented {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let temp_path = temp_dir.join(format!("ps2bt_{}.tmp", name));
+
+        // 1. Copy to temp.
+        if let Err(e) = std::fs::copy(&path, &temp_path) {
+            errors.push(format!("{}: copy to temp failed: {}", name, e));
+            skipped += 1;
+            continue;
+        }
+
+        // Sanity-check the temp copy before touching the original.
+        let temp_size = std::fs::metadata(&temp_path).map(|m| m.len()).unwrap_or(0);
+        if temp_size != size {
+            let _ = std::fs::remove_file(&temp_path);
+            errors.push(format!("{}: temp copy size mismatch ({} vs {})", name, temp_size, size));
+            skipped += 1;
+            continue;
+        }
+
+        // 2. Delete original.
+        if let Err(e) = std::fs::remove_file(&path) {
+            let _ = std::fs::remove_file(&temp_path);
+            errors.push(format!("{}: delete original failed: {}", name, e));
+            skipped += 1;
+            continue;
+        }
+
+        // 3. Write back with fresh cluster allocation.
+        if let Err(e) = std::fs::copy(&temp_path, &path) {
+            // Original is gone — leave temp in place so user can recover.
+            errors.push(format!(
+                "{}: write-back failed: {} — recovery copy at {}",
+                name, e, temp_path.display()
+            ));
+            skipped += 1;
+            continue;
+        }
+
+        // 4. Clean up temp.
+        let _ = std::fs::remove_file(&temp_path);
+        defragged += 1;
+        bytes_moved += size;
+    }
+
+    Ok(DefragResult { defragged, skipped, bytes_moved, errors })
 }
 
 /// Open a native folder picker dialog and return the selected path.
@@ -559,7 +670,9 @@ pub fn rename_game(
                 let name = entry.file_name().to_string_lossy().to_string();
                 if let Some((crc, id, part)) = parse_chunk_name(&name) {
                     if id == game_id && crc == old_crc {
-                        let new_name = split::chunk_file_name(&new_crc, &game_id, part.parse::<u32>().unwrap_or(0));
+                        // Part index is stored as uppercase hex ("00", "0A", …) — parse as hex.
+                        let part_idx = u32::from_str_radix(&part, 16).unwrap_or(0);
+                        let new_name = split::chunk_file_name(&new_crc, &game_id, part_idx);
                         let old_path = entry.path();
                         let new_path = dest_path.join(&new_name);
                         if !new_path.exists() {
@@ -584,6 +697,28 @@ pub fn rename_game(
 /// - a 66-byte `ul.cfg` record: title[0..32], parts(u16)[32..34], id[34..66]
 ///
 /// The old `ul.cfg` preserved the real title, so migration is lossless: we read
+/// Sort entries in `ul.cfg` and rewrite the file.
+///
+/// `sort_by` values: `"name"` | `"name-desc"` | `"size"` | `"size-desc"`.
+/// Size is approximated by `parts` count (each chunk ≈ 1 GiB).
+/// Returns the number of entries written.
+#[tauri::command]
+pub fn sort_ulcfg(dest_dir: String, sort_by: String) -> Result<usize, String> {
+    let path = ulcfg::ulcfg_path(std::path::Path::new(&dest_dir));
+    let mut entries = ulcfg::parse_ulcfg(&path).map_err(|e| e.to_string())?;
+
+    match sort_by.as_str() {
+        "name" => entries.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase())),
+        "name-desc" => entries.sort_by(|a, b| b.title.to_lowercase().cmp(&a.title.to_lowercase())),
+        "size" => entries.sort_by(|a, b| a.parts.cmp(&b.parts)),
+        "size-desc" => entries.sort_by(|a, b| b.parts.cmp(&a.parts)),
+        _ => {}
+    }
+
+    ulcfg::write_ulcfg(&path, &entries).map_err(|e| e.to_string())?;
+    Ok(entries.len())
+}
+
 /// each old entry, compute the correct CRC from the title, rename the chunks to
 /// `ul.<crc>.<game_id>.<part>`, and rewrite `ul.cfg` in the real 64-byte format.
 /// Returns the number of games migrated.

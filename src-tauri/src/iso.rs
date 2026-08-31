@@ -105,6 +105,47 @@ pub fn validate_iso(path: &Path) -> Result<IsoInfo, IsoError> {
     })
 }
 
+/// Determine whether a PS2 ISO is CD (0x12) or DVD (0x14) media.
+///
+/// Detection order:
+/// 1. **UDF VRS check** — PS2 DVD titles use an ISO 9660 + UDF Bridge disc
+///    layout; the UDF Volume Recognition Sequence begins at sector 256
+///    (byte offset 0x80000) with the descriptor tag `"BEA01"`. CD-only titles
+///    use plain ISO 9660 with no UDF, so that sector either doesn't exist or
+///    doesn't carry `"BEA01"`.
+/// 2. **Size fallback** — If the UDF check is inconclusive (sector 256 missing
+///    or unreadable), any image > 700 MiB is treated as DVD.
+///
+/// Returns `0x14` (DVD) or `0x12` (CD).
+pub fn detect_media_type(path: &Path) -> u8 {
+    const UDF_SECTOR_OFFSET: u64 = 256 * 2048; // 0x80000
+    const CD_MAX_BYTES: u64 = 700 * 1024 * 1024;
+    const MEDIA_DVD: u8 = 0x14;
+    const MEDIA_CD: u8 = 0x12;
+
+    if let Ok(mut file) = File::open(path) {
+        let file_size = file.metadata().map(|m| m.len()).unwrap_or(0);
+
+        // UDF VRS "BEA01" at sector 256 is present on DVD, absent on CD.
+        if file_size > UDF_SECTOR_OFFSET + 5 {
+            let mut buf = [0u8; 5];
+            if file.seek(SeekFrom::Start(UDF_SECTOR_OFFSET)).is_ok()
+                && file.read_exact(&mut buf).is_ok()
+                && &buf == b"BEA01"
+            {
+                return MEDIA_DVD;
+            }
+        }
+
+        // Size fallback: images over CD capacity must be DVD.
+        if file_size > CD_MAX_BYTES {
+            return MEDIA_DVD;
+        }
+    }
+
+    MEDIA_CD
+}
+
 /// Read the raw PS2 startup id from an ISO's SYSTEM.CNF, WITH the dot preserved.
 ///
 /// Returns e.g. `SLUS_217.46` (verbatim from `BOOT2 = cdrom0:\SLUS_217.46;1`).

@@ -279,7 +279,13 @@ fn get_device_info_windows(mount_point: &Path) -> Result<DeviceInfo, FsError> {
         .take(2)
         .collect::<String>();
 
-    let output = Command::new("wmic")
+    // wmic CSV columns (with Node prepended by wmic):
+    //   0:Node  1:FileSystem  2:FreeSpace  3:Size  4:VolumeName
+    //
+    // wmic output varies by Windows version — it may start with a blank line,
+    // then a header row, then the data row. Skip any line that isn't parseable
+    // data (i.e. whose numeric fields can't be parsed as u64).
+    let fs_result = Command::new("wmic")
         .args([
             "logicaldisk",
             "where",
@@ -288,32 +294,42 @@ fn get_device_info_windows(mount_point: &Path) -> Result<DeviceInfo, FsError> {
             "FileSystem,FreeSpace,Size,VolumeName",
             "/format:csv",
         ])
-        .output()
-        .map_err(|e| FsError::DetectionFailed(e.to_string()))?;
+        .output();
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let line = stdout.lines().nth(1).unwrap_or("");
+    let mut filesystem = FilesystemType::Unknown("Unknown".into());
+    let mut vol_name = String::new();
 
-    let parts: Vec<&str> = line.split(',').collect();
-    if parts.len() < 5 {
-        return Err(FsError::DetectionFailed("Parse error".into()));
+    if let Ok(output) = fs_result {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // Find the first line that has ≥5 fields AND a parseable Size column (index 3).
+        for line in stdout.lines() {
+            let parts: Vec<&str> = line.split(',').collect();
+            if parts.len() < 5 {
+                continue;
+            }
+            // If parts[3] (Size) parses as u64 it's a data row, not the header.
+            if parts[3].trim().parse::<u64>().is_err() {
+                continue;
+            }
+            filesystem = match parts[1].trim().to_uppercase().as_str() {
+                "FAT32" => FilesystemType::Fat32,
+                "NTFS" => FilesystemType::Ntfs,
+                "EXFAT" => FilesystemType::ExFat,
+                other => FilesystemType::Unknown(other.to_string()),
+            };
+            vol_name = parts[4].trim().to_string();
+            break;
+        }
     }
 
-    let filesystem = match parts[1].trim().to_uppercase().as_str() {
-        "FAT32" => FilesystemType::Fat32,
-        "NTFS" => FilesystemType::Ntfs,
-        "EXFAT" => FilesystemType::ExFat,
-        other => FilesystemType::Unknown(other.to_string()),
-    };
-
-    let free_space: u64 = parts[2].trim().parse().unwrap_or(0);
-    let total_space: u64 = parts[4].trim().parse().unwrap_or(0);
-    let name = parts[3].trim().to_string();
+    // Use GetDiskFreeSpaceEx for reliable space info — wmic parsing is fragile.
+    let (free_space, total_space) = get_space_info(mount_point);
 
     let recommended_mode = filesystem.recommended_mode().to_string();
+    let name = if vol_name.is_empty() { drive } else { vol_name };
 
     Ok(DeviceInfo {
-        name: if name.is_empty() { drive } else { name },
+        name,
         mount_point: mount_point.to_string_lossy().to_string(),
         filesystem,
         free_space,
@@ -431,7 +447,34 @@ fn get_space_info(path: &Path) -> (u64, u64) {
 
     #[cfg(windows)]
     {
-        (0, 0) // placeholder; wmic handles it on Windows
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+        let path_str = path.to_string_lossy();
+        // Ensure path ends with a separator so GetDiskFreeSpaceExW treats it as a directory.
+        let mut p = path_str.into_owned();
+        if !p.ends_with('\\') && !p.ends_with('/') {
+            p.push('\\');
+        }
+        let wide: Vec<u16> = p.encode_utf16().chain(Some(0)).collect();
+
+        let mut free_available: u64 = 0;
+        let mut total_bytes: u64 = 0;
+        let mut total_free: u64 = 0;
+
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut free_available,
+                &mut total_bytes,
+                &mut total_free,
+            )
+        };
+
+        if ok != 0 {
+            (free_available, total_bytes)
+        } else {
+            (0, 0)
+        }
     }
 }
 
