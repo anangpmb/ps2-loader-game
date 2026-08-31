@@ -34,6 +34,8 @@ fn main() {
             commands::format_drive_for_opl,
             commands::get_settings,
             commands::save_settings,
+            commands::scan_source_folder,
+            commands::copy_folder_ordered,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

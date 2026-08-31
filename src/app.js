@@ -1299,6 +1299,139 @@ const App = (() => {
       }
     });
 
+    // ── Safe Restore ──
+    const restoreState = {
+      sourcePath: null,
+      running: false,
+      unlisten: null,
+    };
+
+    function openRestoreModal() {
+      const dest = state.device?.mount_point;
+      $('#restore-dest-display').textContent = dest || 'No drive selected — select one in Step 1';
+      $('#restore-dest-display').style.color = dest ? 'var(--color-text-primary)' : 'var(--color-text-muted)';
+      updateRestoreStartBtn();
+      $('#modal-restore').classList.add('modal-overlay--active');
+    }
+
+    function updateRestoreStartBtn() {
+      $('#btn-restore-start').disabled = !restoreState.sourcePath || !state.device?.mount_point || restoreState.running;
+    }
+
+    async function scanAndShowSource(sourcePath) {
+      if (!invoke) {
+        $('#restore-scan-result').style.display = 'none';
+        updateRestoreStartBtn();
+        return;
+      }
+      try {
+        const scan = await invoke('scan_source_folder', { sourceDir: sourcePath });
+        $('#restore-file-count').textContent = scan.files.length;
+        $('#restore-total-size').textContent = formatBytes(scan.total_bytes);
+
+        // Build subdir summary line.
+        let subdirLine = '';
+        if (scan.subdirs_found && scan.subdirs_found.length > 0) {
+          subdirLine = `<div style="margin-bottom:4px;color:var(--color-text-secondary)">
+            Subdirectories: ${scan.subdirs_found.map(d => `<strong>${d}/</strong>`).join(' · ')}
+          </div>`;
+        }
+        if (scan.subdirs_skipped && scan.subdirs_skipped.length > 0) {
+          subdirLine += `<div style="margin-bottom:4px;color:var(--color-warning)">
+            ⚠ Nested sub-folders inside [${scan.subdirs_skipped.join(', ')}] were skipped (only 1 level deep is supported).
+          </div>`;
+        }
+
+        const listEl = $('#restore-file-list');
+        listEl.innerHTML = subdirLine + scan.files.map(f => {
+          const prefix = f.subdir ? `<span style="color:var(--color-info)">${f.subdir}/</span>` : '';
+          return `<div style="display:flex;justify-content:space-between;padding:1px 0">
+                    <span style="overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:380px">${prefix}${f.name}</span>
+                    <span style="margin-left:8px;white-space:nowrap;color:var(--color-text-muted)">${formatBytes(f.size)}</span>
+                  </div>`;
+        }).join('');
+        $('#restore-scan-result').style.display = 'block';
+        updateRestoreStartBtn();
+      } catch (e) {
+        log('warn', 'Scan failed: ' + e.message);
+      }
+    }
+
+    $('#btn-safe-restore').addEventListener('click', openRestoreModal);
+
+    $('#btn-restore-browse').addEventListener('click', async () => {
+      let selected = null;
+      try {
+        if (invoke) {
+          selected = await invoke('open_folder_dialog');
+        } else if (window.showDirectoryPicker) {
+          const dh = await window.showDirectoryPicker({ mode: 'read' });
+          selected = dh.name;
+        }
+      } catch (e) {
+        log('warn', 'Folder picker failed: ' + e.message);
+      }
+      if (selected) {
+        restoreState.sourcePath = selected;
+        $('#restore-source-path').value = selected;
+        await scanAndShowSource(selected);
+      }
+    });
+
+    $('#btn-restore-start').addEventListener('click', async () => {
+      const source = restoreState.sourcePath;
+      const dest = state.device?.mount_point;
+      if (!source || !dest || restoreState.running) return;
+
+      restoreState.running = true;
+      updateRestoreStartBtn();
+      $('#restore-progress-section').style.display = 'block';
+      $('#restore-progress-fill').style.width = '0%';
+      $('#restore-progress-pct').textContent = '0%';
+      $('#restore-current-file').textContent = 'Starting...';
+      $('#restore-progress-label').textContent = 'Preparing...';
+
+      log('info', `Safe restore: ${source} → ${dest}`);
+
+      // Subscribe to progress events from Rust.
+      if (window.__TAURI__?.event?.listen) {
+        restoreState.unlisten = await window.__TAURI__.event.listen('copy-folder-progress', (event) => {
+          const p = event.payload;
+          $('#restore-progress-fill').style.width = p.total_pct + '%';
+          $('#restore-progress-pct').textContent = p.total_pct + '%';
+          $('#restore-progress-label').textContent = `${p.file_index} / ${p.total_files} files`;
+          $('#restore-current-file').textContent =
+            `[${p.file_index}/${p.total_files}] ${p.file} — ${p.file_pct}%`;
+          // Log only at file start (0%) and file completion (100%).
+          if (p.file_pct === 0) {
+            log('info', `  → [${p.file_index}/${p.total_files}] ${p.file}`);
+          } else if (p.file_pct >= 100) {
+            log('success', `  ✓ [${p.file_index}/${p.total_files}] ${p.file}`);
+          }
+        });
+      }
+
+      try {
+        const result = await invoke('copy_folder_ordered', { sourceDir: source, destDir: dest });
+        log('success', `Restore complete — ${result.copied} copied · ${result.skipped} skipped · ${formatBytes(result.total_bytes)}`);
+        for (const err of (result.errors || [])) log('error', `  ↳ ${err}`);
+        if (result.errors.length === 0) {
+          toast('success', `Restore done: ${result.copied} file(s)`);
+        } else {
+          toast('warn', `Restore done — ${result.errors.length} error(s), check log`);
+        }
+        refreshDeviceGames();
+      } catch (e) {
+        log('error', 'Restore failed: ' + e.message);
+        toast('error', 'Restore failed: ' + e.message);
+      } finally {
+        restoreState.running = false;
+        if (restoreState.unlisten) { restoreState.unlisten(); restoreState.unlisten = null; }
+        updateRestoreStartBtn();
+        $('#restore-progress-fill').style.width = '100%';
+      }
+    });
+
     $('#btn-format-opl').addEventListener('click', async () => {
       if (!state.device?.mount_point) {
         toast('error', 'Select a target drive first');

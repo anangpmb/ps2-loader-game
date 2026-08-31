@@ -251,6 +251,10 @@
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="4" rx="1"/><rect x="2" y="10" width="14" height="4" rx="1"/><rect x="2" y="17" width="18" height="4" rx="1"/></svg>
               Rewrite Fragmented Files
             </button>
+            <button class="btn btn--sm" style="width:100%;justify-content:center" id="btn-safe-restore">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              Safe Restore from Backup
+            </button>
             <button class="btn btn--sm btn--danger" style="width:100%;justify-content:center" id="btn-format-opl">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
               Format for OPL (FAT32)
@@ -264,6 +268,81 @@
     <footer style="text-align:center;padding:var(--space-4);color:var(--color-text-muted);font-size:var(--text-xs);border-top:1px solid var(--color-border)">
       PS2 Backup Tool v0.1.0 — Built for OPL + USBExtreme format
     </footer>
+  </div>
+
+  <!-- Safe Restore Modal -->
+  <div class="modal-overlay" id="modal-restore">
+    <div class="modal" style="max-width:560px">
+      <div class="modal__header">
+        <div class="modal__title">Safe Restore from Backup</div>
+        <button class="modal__close" data-close="modal-restore">&times;</button>
+      </div>
+      <div class="modal__body">
+        <p style="font-size:var(--text-sm);color:var(--color-text-secondary);margin-bottom:var(--space-4)">
+          Files are copied one at a time, largest first — prevents FAT32 fragmentation.
+          Files already on the target with the same size are skipped (resume-safe).
+        </p>
+
+        <!-- Source -->
+        <div style="margin-bottom:var(--space-4)">
+          <label style="font-size:var(--text-sm);color:var(--color-text-secondary);display:block;margin-bottom:var(--space-2)">Source Folder (Backup)</label>
+          <div style="display:flex;gap:var(--space-2)">
+            <input type="text" id="restore-source-path" readonly placeholder="No folder selected"
+              style="flex:1;padding:var(--space-2) var(--space-3);background:var(--color-bg-surface);
+                     border:1px solid var(--color-border);border-radius:var(--radius-md);
+                     color:var(--color-text-primary);font-family:var(--font-mono);font-size:var(--text-sm)">
+            <button class="btn btn--sm btn--primary" id="btn-restore-browse">Browse</button>
+          </div>
+        </div>
+
+        <!-- Destination -->
+        <div style="margin-bottom:var(--space-4)">
+          <label style="font-size:var(--text-sm);color:var(--color-text-secondary);display:block;margin-bottom:var(--space-2)">Destination (Target Device)</label>
+          <div id="restore-dest-display"
+            style="padding:var(--space-2) var(--space-3);background:var(--color-bg-surface);
+                   border:1px solid var(--color-border);border-radius:var(--radius-md);
+                   color:var(--color-text-muted);font-family:var(--font-mono);font-size:var(--text-sm)">
+            No drive selected — select one in Step 1
+          </div>
+        </div>
+
+        <!-- File preview -->
+        <div id="restore-scan-result" style="display:none;margin-bottom:var(--space-4)">
+          <div style="font-size:var(--text-sm);color:var(--color-text-secondary);margin-bottom:var(--space-2)">
+            Files to copy (<span id="restore-file-count">0</span> files · <span id="restore-total-size">0 B</span>):
+          </div>
+          <div id="restore-file-list"
+            style="max-height:160px;overflow-y:auto;background:var(--color-bg-surface);
+                   border:1px solid var(--color-border);border-radius:var(--radius-md);
+                   padding:var(--space-2);font-family:var(--font-mono);font-size:11px;
+                   color:var(--color-text-secondary)">
+          </div>
+        </div>
+
+        <!-- Progress (shown while running) -->
+        <div id="restore-progress-section" style="display:none">
+          <div style="font-size:var(--text-sm);color:var(--color-text-secondary);margin-bottom:var(--space-2)" id="restore-current-file">
+            Preparing...
+          </div>
+          <div class="progress" style="margin-bottom:var(--space-2)">
+            <div class="progress__bar">
+              <div class="progress__fill" id="restore-progress-fill" style="width:0%"></div>
+            </div>
+            <div class="progress__detail">
+              <span id="restore-progress-label">0 / 0 files</span>
+              <span id="restore-progress-pct">0%</span>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="modal__footer">
+        <button class="btn btn--ghost btn--sm" data-close="modal-restore">Cancel</button>
+        <button class="btn btn--primary btn--sm" id="btn-restore-start" disabled>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="currentColor"><polygon points="5 3 19 12 5 21 5 3"/></svg>
+          Start Copy
+        </button>
+      </div>
+    </div>
   </div>
 
   <!-- Settings Modal -->

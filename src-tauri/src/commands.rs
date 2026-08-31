@@ -956,6 +956,270 @@ pub fn save_settings(settings: AppSettings, state: State<AppState>) -> Result<()
     Ok(())
 }
 
+// ── Safe Restore (copy folder ordered) ──────────────────────────────────────
+
+/// One file entry returned by `scan_source_folder`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SourceFile {
+    pub name: String,
+    pub subdir: Option<String>, // None = root, Some("CD") / Some("DVD")
+    pub size: u64,
+}
+
+/// Summary returned by `scan_source_folder`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SourceScanResult {
+    pub files: Vec<SourceFile>,
+    pub total_bytes: u64,
+    /// Immediate subdirectory names that were scanned (empty = root-only backup).
+    pub subdirs_found: Vec<String>,
+    /// Subdirectories that were skipped because they contain deeper nesting (> 1 level).
+    pub subdirs_skipped: Vec<String>,
+}
+
+/// Progress event payload emitted during `copy_folder_ordered`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CopyFolderProgress {
+    pub file: String,
+    pub file_index: usize, // 1-based
+    pub total_files: usize,
+    pub file_pct: u8,
+    pub total_pct: u8,
+}
+
+/// Final result returned by `copy_folder_ordered`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CopyFolderResult {
+    pub copied: usize,
+    pub skipped: usize,
+    pub total_bytes: u64,
+    pub errors: Vec<String>,
+}
+
+/// Scan a folder and return its files sorted largest-first.
+/// Handles root files plus all immediate subdirectories (1 level deep).
+/// Deeper nesting is reported in `subdirs_skipped` but not copied.
+#[tauri::command]
+pub fn scan_source_folder(source_dir: String) -> Result<SourceScanResult, String> {
+    let root = PathBuf::from(&source_dir);
+    let (mut files, subdirs_found, subdirs_skipped) = collect_source_files(&root);
+    files.sort_by(|a, b| b.size.cmp(&a.size));
+    let total_bytes = files.iter().map(|f| f.size).sum();
+    Ok(SourceScanResult { files, total_bytes, subdirs_found, subdirs_skipped })
+}
+
+/// Copy all files from `source_dir` to `dest_dir`, one at a time, largest
+/// first. Emits `copy-folder-progress` Tauri events during the copy so the
+/// frontend can update a progress bar. Files that already exist at the
+/// destination with the correct size are skipped (resume-safe).
+#[tauri::command]
+pub async fn copy_folder_ordered(
+    app: tauri::AppHandle,
+    source_dir: String,
+    dest_dir: String,
+) -> Result<CopyFolderResult, String> {
+    tokio::task::spawn_blocking(move || {
+        copy_folder_impl(&app, &PathBuf::from(source_dir), &PathBuf::from(dest_dir))
+    })
+    .await
+    .map_err(|e| format!("Task failed: {}", e))?
+}
+
+/// Collect files from a backup folder up to 1 level deep.
+///
+/// Returns `(files, subdirs_found, subdirs_skipped)`.
+/// - Root files are collected with `subdir: None`.
+/// - Files inside any immediate subdirectory are collected with `subdir: Some(name)`.
+/// - Sub-subdirectories (depth > 1) are ignored; their parent name goes into `subdirs_skipped`.
+fn collect_source_files(
+    root: &std::path::Path,
+) -> (Vec<SourceFile>, Vec<String>, Vec<String>) {
+    let mut files: Vec<SourceFile> = Vec::new();
+    let mut subdirs_found: Vec<String> = Vec::new();
+    let mut subdirs_skipped: Vec<String> = Vec::new();
+
+    let Ok(rd) = std::fs::read_dir(root) else {
+        return (files, subdirs_found, subdirs_skipped);
+    };
+
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.is_file() {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            let name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            files.push(SourceFile { name, subdir: None, size });
+        } else if path.is_dir() {
+            let subdir_name = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+
+            let Ok(sub_rd) = std::fs::read_dir(&path) else { continue; };
+
+            let mut has_nested_dirs = false;
+            for sub in sub_rd.flatten() {
+                let sub_path = sub.path();
+                if sub_path.is_dir() {
+                    // Flag deeper nesting — we don't recurse beyond 1 level.
+                    has_nested_dirs = true;
+                } else if sub_path.is_file() {
+                    let size = sub.metadata().map(|m| m.len()).unwrap_or(0);
+                    let name = sub_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().to_string())
+                        .unwrap_or_default();
+                    files.push(SourceFile {
+                        name,
+                        subdir: Some(subdir_name.clone()),
+                        size,
+                    });
+                }
+            }
+
+            subdirs_found.push(subdir_name.clone());
+            if has_nested_dirs {
+                subdirs_skipped.push(subdir_name);
+            }
+        }
+    }
+
+    subdirs_found.sort();
+    subdirs_skipped.sort();
+    (files, subdirs_found, subdirs_skipped)
+}
+
+fn copy_folder_impl(
+    app: &tauri::AppHandle,
+    source_path: &std::path::Path,
+    dest_path: &std::path::Path,
+) -> Result<CopyFolderResult, String> {
+    std::fs::create_dir_all(dest_path)
+        .map_err(|e| format!("Cannot create dest dir: {}", e))?;
+
+    let (mut files, _subdirs_found, _subdirs_skipped) = collect_source_files(source_path);
+    files.sort_by(|a, b| b.size.cmp(&a.size));
+
+    let total_files = files.len();
+    let total_bytes: u64 = files.iter().map(|f| f.size).sum();
+    let mut global_bytes: u64 = 0;
+    let mut copied = 0usize;
+    let mut skipped = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+
+    for (idx, file) in files.iter().enumerate() {
+        // Build dest path — create subdir (CD/ / DVD/) if needed.
+        let dest_file = if let Some(ref sub) = file.subdir {
+            let sub_dir = dest_path.join(sub);
+            if let Err(e) = std::fs::create_dir_all(&sub_dir) {
+                errors.push(format!("Cannot create {}/: {}", sub, e));
+                global_bytes += file.size;
+                continue;
+            }
+            sub_dir.join(&file.name)
+        } else {
+            dest_path.join(&file.name)
+        };
+
+        // Skip if dest already has the right size (resume-safe).
+        if dest_file.exists() {
+            if std::fs::metadata(&dest_file).map(|m| m.len()).unwrap_or(0) == file.size {
+                skipped += 1;
+                global_bytes += file.size;
+                continue;
+            }
+        }
+
+        match stream_copy_file(app, source_path, &dest_file, file, idx + 1, total_files, global_bytes, total_bytes) {
+            Ok(written) => {
+                global_bytes += written;
+                copied += 1;
+            }
+            Err(e) => {
+                errors.push(e);
+                global_bytes += file.size;
+            }
+        }
+    }
+
+    Ok(CopyFolderResult { copied, skipped, total_bytes, errors })
+}
+
+/// Stream-copy one file, emitting progress events every time total_pct advances.
+fn stream_copy_file(
+    app: &tauri::AppHandle,
+    source_root: &std::path::Path,
+    dest_path: &std::path::Path,
+    file: &SourceFile,
+    file_index: usize,
+    total_files: usize,
+    global_bytes_before: u64,
+    total_bytes: u64,
+) -> Result<u64, String> {
+    use tauri::Emitter;
+    use std::io::{Read, Write};
+
+    let src_path = if let Some(ref sub) = file.subdir {
+        source_root.join(sub).join(&file.name)
+    } else {
+        source_root.join(&file.name)
+    };
+
+    let src_file = std::fs::File::open(&src_path)
+        .map_err(|e| format!("{}: open failed: {}", file.name, e))?;
+    let mut reader = std::io::BufReader::with_capacity(8 * 1024 * 1024, src_file);
+
+    let dest_file = std::fs::OpenOptions::new()
+        .write(true).create(true).truncate(true)
+        .open(dest_path)
+        .map_err(|e| format!("{}: create dest failed: {}", file.name, e))?;
+    let mut writer = std::io::BufWriter::with_capacity(8 * 1024 * 1024, dest_file);
+
+    // Emit "starting this file" event.
+    let _ = app.emit("copy-folder-progress", CopyFolderProgress {
+        file: file.name.clone(),
+        file_index,
+        total_files,
+        file_pct: 0,
+        total_pct: if total_bytes > 0 { (global_bytes_before * 100 / total_bytes) as u8 } else { 0 },
+    });
+
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    let mut bytes_written: u64 = 0;
+    let mut last_emitted_pct: u8 = 0;
+
+    loop {
+        let n = reader.read(&mut buf)
+            .map_err(|e| format!("{}: read failed: {}", file.name, e))?;
+        if n == 0 { break; }
+        writer.write_all(&buf[..n])
+            .map_err(|e| format!("{}: write failed: {}", file.name, e))?;
+        bytes_written += n as u64;
+
+        let file_pct = if file.size > 0 { (bytes_written * 100 / file.size).min(100) as u8 } else { 100 };
+        let total_pct = if total_bytes > 0 {
+            ((global_bytes_before + bytes_written) * 100 / total_bytes).min(100) as u8
+        } else { 100 };
+
+        // Emit only when total percentage advances to keep IPC traffic low.
+        if total_pct > last_emitted_pct || file_pct == 100 {
+            last_emitted_pct = total_pct;
+            let _ = app.emit("copy-folder-progress", CopyFolderProgress {
+                file: file.name.clone(),
+                file_index,
+                total_files,
+                file_pct,
+                total_pct,
+            });
+        }
+    }
+
+    writer.flush().map_err(|e| format!("{}: flush failed: {}", file.name, e))?;
+    Ok(bytes_written)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
