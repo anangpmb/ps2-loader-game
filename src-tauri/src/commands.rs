@@ -195,14 +195,95 @@ pub async fn process_iso(
     if use_split {
         let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
         let entry = UlEntry {
-            title,
-            game_id,
+            title: title.clone(),
+            game_id: game_id.clone(),
             parts: result.chunks.len() as u16,
             media,
             mount_point: dest_dir,
         };
         ulcfg::add_entry(&ulcfg_path, &entry).map_err(|e| e.to_string())?;
     }
+
+    // ── Post-copy health checks ──
+    // These do not abort the copy (which already succeeded) but surface issues
+    // that could prevent the game from booting on real PS2 hardware via OPL.
+    let mut warnings: Vec<String> = Vec::new();
+
+    // Title > 32 chars: ul.cfg name field is 32 bytes. The CRC was computed from
+    // the full title above, so the filenames are consistent — but OPL will read a
+    // different (truncated) string from ul.cfg and recompute a different CRC,
+    // causing it to fail to locate the chunk files.
+    if title.len() > 32 {
+        warnings.push(format!(
+            "Title \"{}\" is {} chars (max 32 for OPL). \
+             Rename the ISO file to a shorter name, then re-copy.",
+            title,
+            title.len()
+        ));
+    }
+
+    // Game ID > 12 chars: ul.cfg image field is 15 bytes ("ul." prefix uses 3).
+    if game_id.len() > 12 {
+        warnings.push(format!(
+            "Game ID \"{}\" is {} chars; only 12 fit in ul.cfg's image field. \
+             OPL may not locate chunk files.",
+            game_id,
+            game_id.len()
+        ));
+    }
+
+    // Media type must be 0x12 (CD) or 0x14 (DVD).
+    if media != ulcfg::MEDIA_CD && media != ulcfg::MEDIA_DVD {
+        warnings.push(format!(
+            "Unrecognised media type 0x{:02X} (expected 0x12=CD or 0x14=DVD). \
+             Game may boot with wrong sector addressing.",
+            media
+        ));
+    }
+
+    // Chunk-level: failed verification = data may be corrupted.
+    for chunk in &result.chunks {
+        if !chunk.verified {
+            warnings.push(format!(
+                "Chunk {:02} failed checksum verification — copy may be corrupt. \
+                 Delete and re-copy the game.",
+                chunk.index
+            ));
+        }
+        if chunk.size == 0 {
+            warnings.push(format!(
+                "Chunk {:02} has zero size — source ISO may be truncated.",
+                chunk.index
+            ));
+        }
+    }
+
+    // Last chunk < 512 bytes is a strong signal the ISO was cut short.
+    if let Some(last) = result.chunks.last() {
+        if last.size > 0 && last.size < 512 {
+            warnings.push(format!(
+                "Last chunk is only {} bytes — ISO appears truncated. \
+                 Obtain a complete ISO and re-copy.",
+                last.size
+            ));
+        }
+    }
+
+    // Non-split: verify the ISO landed in the right directory.
+    if !use_split {
+        let expected_subdir = if media == ulcfg::MEDIA_CD { "CD" } else { "DVD" };
+        let iso_path = dest_path.join(expected_subdir).join(format!("{}.iso", game_id));
+        if !iso_path.exists() {
+            warnings.push(format!(
+                "Expected ISO at {}/{}.iso but the file was not found. \
+                 OPL will not see this game.",
+                expected_subdir, game_id
+            ));
+        }
+    }
+
+    let mut result = result;
+    result.warnings = warnings;
 
     Ok(result)
 }

@@ -587,6 +587,7 @@ body {
 .toast--success { border-left: 3px solid var(--color-success); }
 .toast--error { border-left: 3px solid var(--color-error); }
 .toast--info { border-left: 3px solid var(--color-info); }
+.toast--warn { border-left: 3px solid var(--color-warning); }
 
 .toast__msg {
   font-size: var(--text-sm);

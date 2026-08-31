@@ -65,6 +65,7 @@ pub struct SplitResult {
     pub chunks: Vec<ChunkResult>,
     pub total_size: u64,
     pub error: Option<String>,
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +157,7 @@ where
         chunks,
         total_size: file_size,
         error: None,
+        warnings: vec![],
     })
 }
 
@@ -345,6 +347,7 @@ where
         }],
         total_size: file_size,
         error: None,
+        warnings: vec![],
     })
 }
 

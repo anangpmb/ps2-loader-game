@@ -368,7 +368,12 @@ const App = (() => {
           gameId: queueItem.gameId || queueItem.name.replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_]/g, '_'),
         });
         onProgress({ phase: 'done', pct: 100 });
-        return { success: result.success, checksum: result.chunks?.[0]?.checksum };
+        return {
+          success: result.success,
+          checksum: result.chunks?.[0]?.checksum,
+          warnings: result.warnings || [],
+          chunks: result.chunks || [],
+        };
       }
 
       if (!destDirHandle) throw new Error('No destination folder. Click "Refresh" to select one.');
@@ -772,8 +777,15 @@ const App = (() => {
           item.progressLabel = 'Complete';
           item.progressPct = 100;
           item.checksum = result.checksum;
-          log('success', `Done: ${item.name} — checksum: ${result.checksum}`);
-          toast('success', `Done: ${item.name}`);
+          const chunkCount = result.chunks?.length || 1;
+          log('success', `Done: ${item.name} — ${chunkCount} chunk(s) · checksum: ${result.checksum}`);
+          // Surface any health warnings so the user knows if the game might not boot.
+          if (result.warnings && result.warnings.length > 0) {
+            result.warnings.forEach(w => log('warn', `  ↳ ${w}`));
+            toast('warn', `${item.name}: ${result.warnings.length} warning(s) — check log`);
+          } else {
+            toast('success', `Done: ${item.name}`);
+          }
         }
       } catch (e) {
         item.status = 'error';
