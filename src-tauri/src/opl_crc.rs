@@ -25,10 +25,9 @@ fn table() -> &'static [u32; 256] {
             let mut crc: i32 = table << 24;
             for _ in 0..8 {
                 if crc < 0 {
-                    // MSB set
-                    crc <<= 1;
+                    crc = (crc << 1) ^ 0x04C1_1DB7;
                 } else {
-                    crc = (crc << 1) ^  0x04C1_1DB7;
+                    crc <<= 1;
                 }
             }
             crctab[(255 - table) as usize] = crc as u32;
@@ -86,9 +85,10 @@ mod tests {
 
     #[test]
     fn empty_name_matches_reference() {
-        // For an empty name the loop processes a single null byte:
-        // crc = tab[0 ^ 0] ^ 0 = tab[0]. tab[0] is stored at index 255-255,
-        // i.e. the entry built from `table = 255`, which shifts to 0.
+        // For an empty name the loop processes a single null byte (b=0, crc=0):
+        // result = tab[(0 ^ 0) as usize] ^ 0 = tab[0].
+        // tab[0] = crctab[255], built from table=0: crc starts at 0, all 8 left-shifts
+        // stay 0 (MSB never set), so crctab[255] = 0. Therefore crc32("") = 0.
         assert_eq!(crc32(""), 0);
     }
 }

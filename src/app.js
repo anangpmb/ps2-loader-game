@@ -42,8 +42,8 @@ const App = (() => {
       for (let table = 0; table < 256; table++) {
         let crc = (table << 24) | 0; // int32
         for (let i = 0; i < 8; i++) {
-          if (crc < 0) crc = (crc << 1) | 0;              // MSB set
-          else crc = ((crc << 1) ^ 0x04C11DB7) | 0;
+          if (crc < 0) crc = ((crc << 1) ^ 0x04C11DB7) | 0;
+          else crc = (crc << 1) | 0;
         }
         t[255 - table] = crc >>> 0;
       }
@@ -389,7 +389,8 @@ const App = (() => {
 
       if (!isSplit) {
         // No-split: copy the whole ISO into CD/ or DVD/ (OPL scans those dirs).
-        const subdir = fileSize < 4_700_000_000 ? 'CD' : 'DVD';
+        // Use media type from UDF check, not file size — small DVD games must go in DVD/.
+        const subdir = media === 0x14 ? 'DVD' : 'CD';
         const targetDir = await destDirHandle.getDirectoryHandle(subdir, { create: true });
         log('info', `No-split mode: writing to ${subdir}/ directory`);
         const fileHandle = await targetDir.getFileHandle(`${gameId}.iso`, { create: true });

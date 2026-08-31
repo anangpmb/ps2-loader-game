@@ -224,7 +224,7 @@ fn write_chunk(
 
     let mut hasher = match config.checksum_algo {
         ChecksumAlgo::Crc32 => ChunkHasher::Crc32(Crc32Hasher::new()),
-        ChecksumAlgo::Xxhash => ChunkHasher::Xxhash(0),
+        ChecksumAlgo::Xxhash => ChunkHasher::Xxhash(xxhash_rust::xxh3::Xxh3::new()),
         ChecksumAlgo::Sha256 => ChunkHasher::Sha256(Sha256::new()),
     };
 
@@ -243,9 +243,7 @@ fn write_chunk(
 
         match &mut hasher {
             ChunkHasher::Crc32(h) => h.update(data),
-            ChunkHasher::Xxhash(state) => {
-                *state = xxhash_rust::xxh3::xxh3_64(data);
-            }
+            ChunkHasher::Xxhash(h) => h.update(data),
             ChunkHasher::Sha256(h) => h.update(data),
         }
 
@@ -256,14 +254,14 @@ fn write_chunk(
 
     Ok(match hasher {
         ChunkHasher::Crc32(h) => format!("{:08x}", h.finalize()),
-        ChunkHasher::Xxhash(state) => format!("{:016x}", state),
+        ChunkHasher::Xxhash(h) => format!("{:016x}", h.digest()),
         ChunkHasher::Sha256(h) => hex::encode(h.finalize()),
     })
 }
 
 enum ChunkHasher {
     Crc32(Crc32Hasher),
-    Xxhash(u64),
+    Xxhash(xxhash_rust::xxh3::Xxh3),
     Sha256(Sha256),
 }
 
@@ -274,7 +272,7 @@ fn verify_chunk(path: &Path, expected_checksum: &str, config: &SplitConfig) -> R
 
     let mut hasher = match config.checksum_algo {
         ChecksumAlgo::Crc32 => ChunkHasher::Crc32(Crc32Hasher::new()),
-        ChecksumAlgo::Xxhash => ChunkHasher::Xxhash(0),
+        ChecksumAlgo::Xxhash => ChunkHasher::Xxhash(xxhash_rust::xxh3::Xxh3::new()),
         ChecksumAlgo::Sha256 => ChunkHasher::Sha256(Sha256::new()),
     };
 
@@ -287,16 +285,14 @@ fn verify_chunk(path: &Path, expected_checksum: &str, config: &SplitConfig) -> R
         let data = &buffer[..bytes_read];
         match &mut hasher {
             ChunkHasher::Crc32(h) => h.update(data),
-            ChunkHasher::Xxhash(state) => {
-                *state = xxhash_rust::xxh3::xxh3_64(data);
-            }
+            ChunkHasher::Xxhash(h) => h.update(data),
             ChunkHasher::Sha256(h) => h.update(data),
         }
     }
 
     let computed = match hasher {
         ChunkHasher::Crc32(h) => format!("{:08x}", h.finalize()),
-        ChunkHasher::Xxhash(state) => format!("{:016x}", state),
+        ChunkHasher::Xxhash(h) => format!("{:016x}", h.digest()),
         ChunkHasher::Sha256(h) => hex::encode(h.finalize()),
     };
 
@@ -304,12 +300,12 @@ fn verify_chunk(path: &Path, expected_checksum: &str, config: &SplitConfig) -> R
 }
 
 /// Copy ISO as-is (no-split mode for NTFS/exFAT).
-/// OPL convention: files go in CD/ or DVD/ directory based on size.
-/// Games < ~4.37 GB (single-layer DVD) go in CD/, larger ones in DVD/.
+/// OPL convention: `media_type` 0x12 → `CD/`, 0x14 → `DVD/`.
 pub fn copy_iso_nosplit<F>(
     source: &Path,
     dest_dir: &Path,
     game_id: &str,
+    media_type: u8,
     config: &SplitConfig,
     mut on_progress: F,
 ) -> Result<SplitResult, SplitError>
@@ -319,9 +315,7 @@ where
     let file = File::open(source)?;
     let file_size = file.metadata()?.len();
 
-    // OPL convention: CD for small games, DVD for large ones
-    // Single-layer DVD capacity ~4.37 GB = 4_700_000_000 bytes
-    let subdir = if file_size < 4_700_000_000 { "CD" } else { "DVD" };
+    let subdir = if media_type == 0x12 { "CD" } else { "DVD" };
     let target_dir = dest_dir.join(subdir);
     std::fs::create_dir_all(&target_dir)?;
 

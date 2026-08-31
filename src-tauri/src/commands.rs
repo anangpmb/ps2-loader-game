@@ -170,6 +170,8 @@ pub async fn process_iso(
     // Game ID = region code from ISO header (e.g. "SLUS_217.46")
     let game_id = iso::extract_startup(&source_path).unwrap_or(game_id);
     let crc_hex = opl_crc::crc32_hex(&title);
+    // Detect media type once here (UDF VRS check) — used by both split and nosplit paths.
+    let media = iso::detect_media_type(&source_path);
 
     // Run in a blocking thread to not freeze the UI
     let source_clone = source_path.clone();
@@ -181,7 +183,7 @@ pub async fn process_iso(
         if use_split {
             split::split_iso(&source_clone, &dest_clone, &crc_clone, &game_id_clone, &config, |_p| {})
         } else {
-            split::copy_iso_nosplit(&source_clone, &dest_clone, &game_id_clone, &config, |_p| {})
+            split::copy_iso_nosplit(&source_clone, &dest_clone, &game_id_clone, media, &config, |_p| {})
         }
     })
     .await
@@ -196,8 +198,7 @@ pub async fn process_iso(
             title,
             game_id,
             parts: result.chunks.len() as u16,
-            // Read media type from ISO (UDF check), not just from file size.
-            media: iso::detect_media_type(&source_path),
+            media,
             mount_point: dest_dir,
         };
         ulcfg::add_entry(&ulcfg_path, &entry).map_err(|e| e.to_string())?;
@@ -638,10 +639,14 @@ pub fn delete_game(
 pub fn rename_game(
     dest_dir: String,
     game_id: String,
-    _mode: String,
+    mode: String,
     _location: String,
     new_title: String,
 ) -> Result<(), String> {
+    if mode != "split" {
+        return Err("Rename is only supported for split-mode games (ul.cfg)".into());
+    }
+
     let dest_path = PathBuf::from(&dest_dir);
     let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
     if !ulcfg_path.exists() {
@@ -665,6 +670,8 @@ pub fn rename_game(
     let old_crc = opl_crc::crc32_hex(&old_title);
     let new_crc = opl_crc::crc32_hex(&new_title);
     if old_crc != new_crc {
+        // Collect all rename pairs before touching the filesystem.
+        let mut pairs: Vec<(PathBuf, PathBuf)> = Vec::new();
         if let Ok(read_dir) = std::fs::read_dir(&dest_path) {
             for entry in read_dir.flatten() {
                 let name = entry.file_name().to_string_lossy().to_string();
@@ -676,12 +683,28 @@ pub fn rename_game(
                         let old_path = entry.path();
                         let new_path = dest_path.join(&new_name);
                         if !new_path.exists() {
-                            std::fs::rename(&old_path, &new_path)
-                                .map_err(|e| format!("Failed to rename {}: {}", name, e))?;
+                            pairs.push((old_path, new_path));
                         }
                     }
                 }
             }
+        }
+
+        // Execute all renames; roll back on failure to leave the game bootable.
+        let mut done: Vec<(PathBuf, PathBuf)> = Vec::new();
+        for (old_path, new_path) in &pairs {
+            if let Err(e) = std::fs::rename(old_path, new_path) {
+                // Undo already-renamed files before returning the error.
+                for (was_old, was_new) in &done {
+                    let _ = std::fs::rename(was_new, was_old);
+                }
+                return Err(format!(
+                    "Failed to rename {}: {}. All changes rolled back.",
+                    old_path.file_name().unwrap_or_default().to_string_lossy(),
+                    e
+                ));
+            }
+            done.push((old_path.clone(), new_path.clone()));
         }
     }
 
@@ -689,14 +712,6 @@ pub fn rename_game(
     Ok(())
 }
 
-/// Migrate games written by this app's old (non-OPL) format into the real
-/// USBExtreme format, so they display correctly here and boot on a real PS2.
-///
-/// Old format on disk:
-/// - chunk files `ul.<game_id>` (part 0), `ul.<game_id>.01`, `ul.<game_id>.02`, ...
-/// - a 66-byte `ul.cfg` record: title[0..32], parts(u16)[32..34], id[34..66]
-///
-/// The old `ul.cfg` preserved the real title, so migration is lossless: we read
 /// Sort entries in `ul.cfg` and rewrite the file.
 ///
 /// `sort_by` values: `"name"` | `"name-desc"` | `"size"` | `"size-desc"`.
@@ -719,9 +734,11 @@ pub fn sort_ulcfg(dest_dir: String, sort_by: String) -> Result<usize, String> {
     Ok(entries.len())
 }
 
-/// each old entry, compute the correct CRC from the title, rename the chunks to
-/// `ul.<crc>.<game_id>.<part>`, and rewrite `ul.cfg` in the real 64-byte format.
-/// Returns the number of games migrated.
+/// Migrate games written by this app's old (non-OPL) format into the real
+/// USBExtreme format, so they display correctly here and boot on a real PS2.
+/// Reads each old entry, computes the correct CRC from the title, renames the
+/// chunks to `ul.<crc>.<game_id>.<part>`, and rewrites `ul.cfg` in the real
+/// 64-byte format. Returns the number of games migrated.
 #[tauri::command]
 pub fn repair_split_files(dest_dir: String) -> Result<u32, String> {
     let dest_path = PathBuf::from(&dest_dir);
