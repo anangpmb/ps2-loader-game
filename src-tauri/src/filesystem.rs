@@ -764,8 +764,10 @@ fn get_extent_count(path: &Path) -> Result<u32, FsError> {
 #[cfg(target_os = "windows")]
 fn get_extent_count(path: &Path) -> Result<u32, FsError> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::FSCTL_GET_RETRIEVAL_POINTERS;
     use windows_sys::Win32::System::IO::DeviceIoControl;
+
+    // CTL_CODE(FILE_DEVICE_FILE_SYSTEM=9, 28, METHOD_NEITHER=3, FILE_ANY_ACCESS=0)
+    const FSCTL_GET_RETRIEVAL_POINTERS: u32 = 0x0009_0073;
 
     #[repr(C)]
     struct StartingVcnInputBuffer {
@@ -780,7 +782,7 @@ fn get_extent_count(path: &Path) -> Result<u32, FsError> {
     }
 
     let file = std::fs::File::open(path).map_err(FsError::Io)?;
-    let handle = file.as_raw_handle() as isize;
+    let handle = file.as_raw_handle(); // *mut c_void — matches HANDLE in windows-sys 0.59
 
     let start_vcn = StartingVcnInputBuffer { starting_vcn: 0 };
     let mut rpb: RetrievalPointersBuffer = unsafe { std::mem::zeroed() };

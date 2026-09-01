@@ -142,7 +142,7 @@ pub async fn process_iso(
     // Create destination directory if it doesn't exist
     std::fs::create_dir_all(&dest_path).map_err(|e| format!("Cannot create dest dir: {}", e))?;
 
-    let file_size = std::fs::metadata(&source_path)
+    let _file_size = std::fs::metadata(&source_path)
         .map(|m| m.len())
         .unwrap_or(0);
 
