@@ -367,7 +367,10 @@ const App = (() => {
 
     async validateISO(file) {
       if (invoke) {
-        return invoke('validate_iso', { path: file.path || file.name });
+        // In Tauri mode `file` may be a plain path string (from native drag-drop)
+        // or a File object with a .path property (older Tauri v1 compat).
+        const path = typeof file === 'string' ? file : (file.path || file.name);
+        return invoke('validate_iso', { path });
       }
       const header = await file.slice(0, 0x8800).arrayBuffer();
       const view = new Uint8Array(header);
@@ -1184,11 +1187,30 @@ const App = (() => {
     dropzone.addEventListener('click', () => fileInput.click());
     dropzone.addEventListener('dragover', e => { e.preventDefault(); dropzone.classList.add('dropzone--active'); });
     dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dropzone--active'));
-    dropzone.addEventListener('drop', e => {
-      e.preventDefault();
-      dropzone.classList.remove('dropzone--active');
-      addFiles(Array.from(e.dataTransfer.files));
-    });
+
+    if (isTauri && window.__TAURI__?.event?.listen) {
+      // Tauri v2: native drag-drop event gives absolute OS paths.
+      // HTML5 File objects from e.dataTransfer.files have no .path in Tauri v2.
+      window.__TAURI__.event.listen('tauri://drag-drop', (event) => {
+        dropzone.classList.remove('dropzone--active');
+        const paths = event.payload?.paths || [];
+        const mockFiles = paths.map(p => ({
+          name: p.replace(/\\/g, '/').split('/').pop(),
+          path: p,
+          size: 0, // filled in by validate_iso result
+        }));
+        if (mockFiles.length) addFiles(mockFiles);
+      });
+      // Prevent HTML5 drop from also firing (would add items with no path).
+      dropzone.addEventListener('drop', e => { e.preventDefault(); dropzone.classList.remove('dropzone--active'); });
+    } else {
+      dropzone.addEventListener('drop', e => {
+        e.preventDefault();
+        dropzone.classList.remove('dropzone--active');
+        addFiles(Array.from(e.dataTransfer.files));
+      });
+    }
+
     fileInput.addEventListener('change', () => { addFiles(Array.from(fileInput.files)); fileInput.value = ''; });
 
     $('#btn-start').addEventListener('click', startProcessing);
