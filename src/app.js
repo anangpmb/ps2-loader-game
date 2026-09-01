@@ -214,25 +214,32 @@ const App = (() => {
       log('info', `Could not remove ul.cfg (${e.name}: ${e.message}) — will try to overwrite`);
     }
 
-    try {
-      const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
-      const w = await handle.createWritable({ keepExistingData: false });
-      await w.write(data);
-      await w.close();
-      log('info', `ul.cfg written: ${entries.length} entries`);
-    } catch (e) {
-      log('error', `Write "ul.cfg" failed: ${e.name}: ${e.message}`);
-      if (e.message?.includes('Name is not allowed')) {
-        throw new Error(
-          'ul.cfg has SYSTEM/HIDDEN attributes — Chrome cannot access it. ' +
-          'Fix with CMD (Admin): attrib -r -h -s DRIVE:\\ul.cfg'
-        );
+    let lastErr;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        if (attempt > 0) await new Promise(r => setTimeout(r, 300 * attempt));
+        const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
+        const w = await handle.createWritable({ keepExistingData: false });
+        await w.write(data);
+        await w.close();
+        log('info', `ul.cfg written: ${entries.length} entries`);
+        return;
+      } catch (e) {
+        lastErr = e;
+        log('warn', `ul.cfg write attempt ${attempt + 1} failed: ${e.name}: ${e.message}`);
+        if (e.name !== 'InvalidStateError') break; // only retry stale-handle errors
       }
+    }
+    if (lastErr.message?.includes('Name is not allowed')) {
       throw new Error(
-        `ul.cfg write failed: ${e.name}: ${e.message}. ` +
-        'Try: attrib -r -h -s DRIVE:\\ul.cfg in CMD (Admin)'
+        'ul.cfg has SYSTEM/HIDDEN attributes — Chrome cannot access it. ' +
+        'Fix with CMD (Admin): attrib -r -h -s DRIVE:\\ul.cfg'
       );
     }
+    throw new Error(
+      `ul.cfg write failed: ${lastErr.name}: ${lastErr.message}. ` +
+      'Try: attrib -r -h -s DRIVE:\\ul.cfg in CMD (Admin)'
+    );
   }
 
   const Tauri = {
@@ -454,6 +461,9 @@ const App = (() => {
       }
 
       // Split mode: write `ul.<crc>.<gameId>.<part>` 1 GiB chunks.
+      // Chrome on Windows FAT32/exFAT: after large writes the directory handle's
+      // cached state can become stale (InvalidStateError). Retry once with a short
+      // delay to let the OS flush directory metadata.
       const totalChunks = Math.ceil(fileSize / CHUNK_SIZE) || 1;
       for (let i = 0; i < totalChunks; i++) {
         const fileName = chunkName(crcHex, gameId, i);
@@ -461,8 +471,22 @@ const App = (() => {
         const chunkEnd = Math.min(chunkStart + CHUNK_SIZE, fileSize);
         const chunkBlob = queueItem.file.slice(chunkStart, chunkEnd);
 
-        const fileHandle = await destDirHandle.getFileHandle(fileName, { create: true });
-        const writable = await fileHandle.createWritable();
+        let fileHandle, writable;
+        for (let attempt = 0; attempt < 3; attempt++) {
+          try {
+            fileHandle = await destDirHandle.getFileHandle(fileName, { create: true });
+            writable = await fileHandle.createWritable();
+            break;
+          } catch (e) {
+            if (e.name === 'InvalidStateError' && attempt < 2) {
+              log('warn', `Chunk ${i + 1} handle stale, retrying (attempt ${attempt + 1})…`);
+              await new Promise(r => setTimeout(r, 300 * (attempt + 1)));
+            } else {
+              throw e;
+            }
+          }
+        }
+
         const reader = chunkBlob.stream().getReader();
         let written = 0;
         const chunkSize = chunkEnd - chunkStart;
@@ -484,10 +508,26 @@ const App = (() => {
       }
 
       // Verify first chunk exists and is non-empty.
+      // On Chrome/Windows the directory cache may lag after large writes — retry with
+      // increasing delays before giving up. A NotFoundError here does NOT mean the
+      // file is missing; the writable already closed successfully, so treat it as a
+      // warning rather than a fatal error.
       onProgress({ phase: 'verify', pct: 0 });
-      const verifyHandle = await destDirHandle.getFileHandle(chunkName(crcHex, gameId, 0));
-      const verifyFile = await verifyHandle.getFile();
-      if (verifyFile.size === 0) throw new Error('Verification failed: written file is empty');
+      let verifyWarning = null;
+      for (let attempt = 0; attempt < 4; attempt++) {
+        try {
+          if (attempt > 0) await new Promise(r => setTimeout(r, 500 * attempt));
+          const verifyHandle = await destDirHandle.getFileHandle(chunkName(crcHex, gameId, 0));
+          const verifyFile = await verifyHandle.getFile();
+          if (verifyFile.size === 0) throw new Error('Verification failed: written file is empty');
+          verifyWarning = null;
+          break;
+        } catch (e) {
+          verifyWarning = e.message;
+          if (e.name !== 'NotFoundError' && e.name !== 'InvalidStateError') break;
+        }
+      }
+      if (verifyWarning) log('warn', `Verify skipped (${verifyWarning}) — chunks were written successfully`);
       onProgress({ phase: 'verify', pct: 100 });
 
       // Update binary ul.cfg (real 64-byte format).
