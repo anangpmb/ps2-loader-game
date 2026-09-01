@@ -194,33 +194,21 @@ const App = (() => {
     const data = encodeUlcfg(entries);
     log('info', `Writing ul.cfg: ${entries.length} entries, ${data.length} bytes`);
 
-    // Try to remove existing ul.cfg using entries() handle
-    try {
-      for await (const [name, handle] of destDirHandle.entries()) {
-        if (name === 'ul.cfg' && handle.kind === 'file') {
-          await destDirHandle.removeEntry('ul.cfg');
-          log('info', 'Removed old ul.cfg');
-          break;
-        }
-      }
-    } catch (e) {
-      log('info', `Remove ul.cfg: ${e.name} (may be locked)`);
-    }
-
-    // Create new ul.cfg
     try {
       const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
-      const w = await handle.createWritable();
+      const w = await handle.createWritable({ keepExistingData: false });
       await w.write(data);
       await w.close();
       log('info', `ul.cfg written: ${entries.length} entries`);
-      return;
     } catch (e) {
       log('error', `Write "ul.cfg" failed: ${e.name}: ${e.message}`);
-      log('error', 'File may be read-only. Try: attrib -r -h -s E:\\ul.cfg');
+      // ul.cfg on a PS2 drive may have read-only/system/hidden attributes.
+      // The browser cannot clear those — throw a clear message so callers can warn.
+      throw new Error(
+        `ul.cfg is read-only or locked. On Windows, run: attrib -r -h -s DRIVE:\\ul.cfg\n` +
+        `Original error: ${e.name}: ${e.message}`
+      );
     }
-
-    throw new Error('Failed to write ul.cfg. Check file attributes.');
   }
 
   const Tauri = {
@@ -457,15 +445,23 @@ const App = (() => {
       onProgress({ phase: 'verify', pct: 100 });
 
       // Update binary ul.cfg (real 64-byte format).
+      // Non-fatal: if ul.cfg is read-only on the drive, chunks are already written correctly.
       onProgress({ phase: 'ulcfg', pct: 0 });
-      let entries = await readUlcfgEntries();
-      entries = entries.filter(e => e.gameId !== gameId);
-      entries.push({ title, gameId, parts: totalChunks, media });
-      log('info', `Adding to ul.cfg: title="${title}" gameId="${gameId}" parts=${totalChunks}`);
-      await writeUlcfgEntries(entries);
+      const ulWarnings = [];
+      try {
+        let entries = await readUlcfgEntries();
+        entries = entries.filter(e => e.gameId !== gameId);
+        entries.push({ title, gameId, parts: totalChunks, media });
+        log('info', `Adding to ul.cfg: title="${title}" gameId="${gameId}" parts=${totalChunks}`);
+        await writeUlcfgEntries(entries);
+      } catch (e) {
+        const msg = `ul.cfg not updated (${e.message}). Use "Generate ul.cfg" after clearing file attributes.`;
+        log('warn', msg);
+        ulWarnings.push(msg);
+      }
       onProgress({ phase: 'ulcfg', pct: 100 });
 
-      return { success: true, checksum: 'verified' };
+      return { success: true, checksum: 'verified', warnings: ulWarnings };
     },
 
     async generateUlCfg() {
@@ -1315,7 +1311,8 @@ const App = (() => {
     }
 
     function updateRestoreStartBtn() {
-      $('#btn-restore-start').disabled = !restoreState.sourcePath || !state.device?.mount_point || restoreState.running;
+      $('#btn-restore-start').disabled =
+        !invoke || !restoreState.sourcePath || !state.device?.mount_point || restoreState.running;
     }
 
     async function scanAndShowSource(sourcePath) {
@@ -1365,8 +1362,9 @@ const App = (() => {
         if (invoke) {
           selected = await invoke('open_folder_dialog');
         } else if (window.showDirectoryPicker) {
-          const dh = await window.showDirectoryPicker({ mode: 'read' });
-          selected = dh.name;
+          // Browser mode: picker returns only a name, not a full native path — can't pass to Rust.
+          await window.showDirectoryPicker({ mode: 'read' });
+          toast('warn', 'Safe Restore requires the desktop app — the browser cannot read native paths');
         }
       } catch (e) {
         log('warn', 'Folder picker failed: ' + e.message);
@@ -1379,6 +1377,10 @@ const App = (() => {
     });
 
     $('#btn-restore-start').addEventListener('click', async () => {
+      if (!invoke) {
+        toast('error', 'Safe Restore requires the desktop app');
+        return;
+      }
       const source = restoreState.sourcePath;
       const dest = state.device?.mount_point;
       if (!source || !dest || restoreState.running) return;
