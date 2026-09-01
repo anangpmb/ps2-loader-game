@@ -83,15 +83,23 @@ pub fn parse_ulcfg(path: &Path) -> Result<Vec<UlEntry>, UlCfgError> {
         let parts = record[PARTS_OFFSET] as u16;
         let media = record[MEDIA_OFFSET];
 
-        if !title.is_empty() {
-            entries.push(UlEntry {
-                title,
-                game_id,
-                parts,
-                media,
-                mount_point: String::new(),
-            });
+        // Skip completely blank records (all-zero padding at end of file).
+        if game_id.is_empty() {
+            offset += ENTRY_SIZE;
+            continue;
         }
+
+        // Some tools (USBUtil, older OPL managers) leave the title field empty.
+        // In that case use the game id as a display name rather than dropping the entry.
+        let title = if title.is_empty() { game_id.clone() } else { title };
+
+        entries.push(UlEntry {
+            title,
+            game_id,
+            parts,
+            media,
+            mount_point: String::new(),
+        });
 
         offset += ENTRY_SIZE;
     }

@@ -113,9 +113,15 @@ const App = (() => {
     let end = off;
     const max = Math.min(off + len, bytes.length);
     while (end < max && bytes[end] !== 0) end++;
-    const raw = new TextDecoder('ascii').decode(bytes.slice(off, end));
-    const cleaned = raw.replace(/[^\x20-\x7E]/g, '').trim();
-    return cleaned.length > 0 ? cleaned : "UNKNOWN_GAME";
+    if (end === off) return '';
+    const slice = bytes.slice(off, end);
+    // Try UTF-8 first (written by this app); fall back to Latin-1 (ISO-8859-1)
+    // for files written by OPL Manager / USBUtil which use Windows-1252 encoding.
+    try {
+      return new TextDecoder('utf-8', { fatal: true }).decode(slice).trim();
+    } catch {
+      return new TextDecoder('iso-8859-1').decode(slice).trim();
+    }
   }
   function encodeUlcfg(entries) {
     const validEntries = entries.filter(e => e.title && e.gameId);
@@ -143,7 +149,7 @@ const App = (() => {
       const media = bytes[off + 0x30];
 
       let title = rawTitle;
-      if (!title || title === "UNKNOWN_GAME" || title.trim() === "") {
+      if (!title || title.trim() === "") {
         title = gameId;
       }
 

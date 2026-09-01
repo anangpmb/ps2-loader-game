@@ -578,17 +578,34 @@ pub fn list_device_games(dest_dir: String) -> Result<Vec<GameEntry>, String> {
 
     // 1. Parse ul.cfg for split-mode entries (one entry == one game, already grouped).
     let ulcfg_path = ulcfg::ulcfg_path(&dest_path);
-    if let Ok(entries) = ulcfg::parse_ulcfg(&ulcfg_path) {
-        for entry in entries {
-            let crc_hex = opl_crc::crc32_hex(&entry.title);
-            let total_size = sum_chunk_sizes(&dest_path, &crc_hex, &entry.game_id, entry.parts);
+    match ulcfg::parse_ulcfg(&ulcfg_path) {
+        Ok(entries) => {
+            for entry in entries {
+                let crc_hex = opl_crc::crc32_hex(&entry.title);
+                let total_size =
+                    sum_chunk_sizes(&dest_path, &crc_hex, &entry.game_id, entry.parts);
+                games.push(GameEntry {
+                    game_id: entry.game_id,
+                    title: entry.title,
+                    parts: entry.parts,
+                    size: total_size,
+                    location: "root".into(),
+                    mode: "split".into(),
+                });
+            }
+        }
+        Err(e) => {
+            // Surface the error as a synthetic "error" entry so the UI can show it
+            // instead of silently falling through to the orphan scan which would
+            // display game IDs as titles.
+            eprintln!("[list_device_games] ul.cfg read failed: {}", e);
             games.push(GameEntry {
-                game_id: entry.game_id,
-                title: entry.title,
-                parts: entry.parts,
-                size: total_size,
+                game_id: String::new(),
+                title: format!("[ul.cfg error: {}]", e),
+                parts: 0,
+                size: 0,
                 location: "root".into(),
-                mode: "split".into(),
+                mode: "error".into(),
             });
         }
     }
