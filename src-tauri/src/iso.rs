@@ -217,6 +217,13 @@ fn extract_game_id(file: &mut File) -> Result<String, IsoError> {
     Err(IsoError::InvalidFormat("SYSTEM.CNF not found".into()))
 }
 
+/// Extract the ISO9660 volume label from a file path.
+/// Returns `None` when the file can't be opened or the PVD is missing.
+pub fn extract_volume_label_from_path(path: &Path) -> Option<String> {
+    let mut file = File::open(path).ok()?;
+    extract_volume_label(&mut file)
+}
+
 /// Extract volume label from ISO9660 primary volume descriptor.
 /// Volume label is at offset 0x40 (64 bytes) from the start of the PVD.
 /// PVD starts at sector 16 (offset 0x8000), so label is at 0x8040.

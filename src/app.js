@@ -756,8 +756,8 @@ const App = (() => {
       }
     } catch (e) {
       item.status = 'error';
-      item.error = e.message;
-      log('error', `Validation error: ${item.name} — ${e.message}`);
+      item.error = errStr(e);
+      log('error', `Validation error: ${item.name} — ${errStr(e)}`);
     }
     renderQueue();
   }
@@ -828,8 +828,8 @@ const App = (() => {
         }
       } catch (e) {
         item.status = 'error';
-        item.error = e.message;
-        log('error', `Failed: ${item.name} — ${e.message}`);
+        item.error = errStr(e);
+        log('error', `Failed: ${item.name} — ${errStr(e)}`);
         toast('error', `Failed: ${item.name}`);
       }
 

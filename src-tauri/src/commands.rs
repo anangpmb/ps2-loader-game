@@ -159,16 +159,47 @@ pub async fn process_iso(
         }
     };
 
-    // Display title = filename without extension (user can rename file to change title)
-    let title = ulcfg::extract_title(
+    // Game ID = region code from ISO header (e.g. "SLUS_217.46"), with the passed id as fallback.
+    let game_id = iso::extract_startup(&source_path).unwrap_or(game_id);
+
+    // Display title — preference order:
+    //   1. Filename stem after " - " separator (e.g. "SLUS_200.00 - God of War.iso" → "God of War")
+    //   2. ISO9660 volume label (e.g. "GOD OF WAR") if filename has no ` - ` separator or looks
+    //      like a raw game ID
+    //   3. Filename stem as-is (last resort — may be a game ID like "SLUS_200.00")
+    let filename_title = ulcfg::extract_title(
         source_path
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default()
             .as_str(),
     );
-    // Game ID = region code from ISO header (e.g. "SLUS_217.46")
-    let game_id = iso::extract_startup(&source_path).unwrap_or(game_id);
+    // A title "looks like a game ID" when it matches the SLUS_XXX.XX / SCES_XXX.XX pattern.
+    let looks_like_game_id = |s: &str| -> bool {
+        let bytes = s.as_bytes();
+        if bytes.len() < 9 { return false; }
+        bytes[..4].iter().all(|b| b.is_ascii_uppercase())
+            && bytes[4] == b'_'
+            && bytes[5..8].iter().all(|b| b.is_ascii_digit())
+            && bytes[8] == b'.'
+            && bytes[9..].iter().all(|b| b.is_ascii_digit())
+    };
+    let title = if looks_like_game_id(&filename_title) {
+        // Filename is a raw game ID — prefer the ISO volume label (more readable).
+        iso::extract_volume_label_from_path(&source_path)
+            .filter(|lbl| !lbl.is_empty() && !looks_like_game_id(lbl))
+            .unwrap_or(filename_title)
+    } else {
+        filename_title
+    };
+    // Truncate to 32 chars (ul.cfg NAME field limit) BEFORE computing the CRC.
+    // encode_entry writes at most 32 bytes; if title is longer OPL reads only 32
+    // bytes from ul.cfg, recomputes a different CRC, and can't find the chunks.
+    let title = if title.len() > 32 {
+        title.chars().take(32).collect::<String>()
+    } else {
+        title
+    };
     let crc_hex = opl_crc::crc32_hex(&title);
     // Detect media type once here (UDF VRS check) — used by both split and nosplit paths.
     let media = iso::detect_media_type(&source_path);
@@ -208,19 +239,6 @@ pub async fn process_iso(
     // These do not abort the copy (which already succeeded) but surface issues
     // that could prevent the game from booting on real PS2 hardware via OPL.
     let mut warnings: Vec<String> = Vec::new();
-
-    // Title > 32 chars: ul.cfg name field is 32 bytes. The CRC was computed from
-    // the full title above, so the filenames are consistent — but OPL will read a
-    // different (truncated) string from ul.cfg and recompute a different CRC,
-    // causing it to fail to locate the chunk files.
-    if title.len() > 32 {
-        warnings.push(format!(
-            "Title \"{}\" is {} chars (max 32 for OPL). \
-             Rename the ISO file to a shorter name, then re-copy.",
-            title,
-            title.len()
-        ));
-    }
 
     // Game ID > 12 chars: ul.cfg image field is 15 bytes ("ul." prefix uses 3).
     if game_id.len() > 12 {
@@ -595,18 +613,10 @@ pub fn list_device_games(dest_dir: String) -> Result<Vec<GameEntry>, String> {
             }
         }
         Err(e) => {
-            // Surface the error as a synthetic "error" entry so the UI can show it
-            // instead of silently falling through to the orphan scan which would
-            // display game IDs as titles.
+            // Log the error so it's visible in the Tauri dev console / stderr.
+            // Do not add a fake game entry — an empty game_id breaks the UI render.
+            // The orphan scan below will still find chunk files and list them by game_id.
             eprintln!("[list_device_games] ul.cfg read failed: {}", e);
-            games.push(GameEntry {
-                game_id: String::new(),
-                title: format!("[ul.cfg error: {}]", e),
-                parts: 0,
-                size: 0,
-                location: "root".into(),
-                mode: "error".into(),
-            });
         }
     }
 
