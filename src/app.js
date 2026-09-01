@@ -29,6 +29,10 @@ const App = (() => {
     console.log('[PS2BT] Tauri dialog.open:', typeof window.__TAURI__?.dialog?.open);
   }
 
+  // Tauri invoke() rejects with a plain string, not an Error object.
+  // This helper normalises both so catch blocks always get a usable message.
+  function errStr(e) { return e?.message ?? String(e); }
+
   // ── OPL USBExtreme format helpers (browser mode) ──
   // Mirror of the Rust backend (opl_crc.rs / ulcfg.rs / split.rs) so drives
   // written in browser mode use the real, PS2-bootable format.
@@ -200,6 +204,16 @@ const App = (() => {
     const data = encodeUlcfg(entries);
     log('info', `Writing ul.cfg: ${entries.length} entries, ${data.length} bytes`);
 
+    // Delete old ul.cfg first: PS2 drives created by USBUtil/OPL set the SYSTEM+HIDDEN
+    // attribute which causes Chrome to refuse getFileHandle with "Name is not allowed".
+    // Removing the file first lets Chrome create a clean one without those attributes.
+    try {
+      await destDirHandle.removeEntry('ul.cfg');
+      log('info', 'Removed old ul.cfg');
+    } catch (e) {
+      log('info', `Could not remove ul.cfg (${e.name}: ${e.message}) — will try to overwrite`);
+    }
+
     try {
       const handle = await destDirHandle.getFileHandle('ul.cfg', { create: true });
       const w = await handle.createWritable({ keepExistingData: false });
@@ -208,11 +222,15 @@ const App = (() => {
       log('info', `ul.cfg written: ${entries.length} entries`);
     } catch (e) {
       log('error', `Write "ul.cfg" failed: ${e.name}: ${e.message}`);
-      // ul.cfg on a PS2 drive may have read-only/system/hidden attributes.
-      // The browser cannot clear those — throw a clear message so callers can warn.
+      if (e.message?.includes('Name is not allowed')) {
+        throw new Error(
+          'ul.cfg has SYSTEM/HIDDEN attributes — Chrome cannot access it. ' +
+          'Fix with CMD (Admin): attrib -r -h -s DRIVE:\\ul.cfg'
+        );
+      }
       throw new Error(
-        `ul.cfg is read-only or locked. On Windows, run: attrib -r -h -s DRIVE:\\ul.cfg\n` +
-        `Original error: ${e.name}: ${e.message}`
+        `ul.cfg write failed: ${e.name}: ${e.message}. ` +
+        'Try: attrib -r -h -s DRIVE:\\ul.cfg in CMD (Admin)'
       );
     }
   }
@@ -243,9 +261,20 @@ const App = (() => {
                 log('info', 'Selected folder: ' + selected);
                 try {
                   const info = await invoke('get_device_info_for_path', { path: selected });
-                  return [{ ...info, mount_point: selected, is_removable: true }];
+                  // Guard: block non-removable drives that look like system roots (e.g. C:\).
+                  // The Rust backend sets is_removable=false for DRIVE_FIXED system drives.
+                  if (info.is_removable === false) {
+                    const norm = selected.replace(/\//g, '\\').toUpperCase();
+                    // Only block if it's a drive root (X:\), not a subfolder on a fixed drive.
+                    if (/^[A-Z]:\\?$/.test(norm)) {
+                      log('error', `${selected} is a system drive root and cannot be used as a target.`);
+                      toast('error', `${selected} is a system drive — select a USB or external drive.`);
+                      return [];
+                    }
+                  }
+                  return [{ ...info, mount_point: selected }];
                 } catch (e2) {
-                  log('warn', 'Could not read device info: ' + e2.message);
+                  log('warn', 'Could not read device info: ' + errStr(e2));
                 }
                 return [{
                   name: selected.split('/').pop() || selected.split('\\').pop() || selected,
@@ -264,7 +293,15 @@ const App = (() => {
                 if (selected) {
                   try {
                     const info = await invoke('get_device_info_for_path', { path: selected });
-                    return [{ ...info, mount_point: selected, is_removable: true }];
+                    if (info.is_removable === false) {
+                      const norm2 = selected.replace(/\//g, '\\').toUpperCase();
+                      if (/^[A-Z]:\\?$/.test(norm2)) {
+                        log('error', `${selected} is a system drive root and cannot be used as a target.`);
+                        toast('error', `${selected} is a system drive — select a USB or external drive.`);
+                        return [];
+                      }
+                    }
+                    return [{ ...info, mount_point: selected }];
                   } catch {}
                   return [{
                     name: selected.split('/').pop() || selected,
@@ -276,11 +313,11 @@ const App = (() => {
                   }];
                 }
               } catch (e2) {
-                log('warn', 'Fallback dialog failed: ' + e2.message);
+                log('warn', 'Fallback dialog failed: ' + errStr(e2));
               }
             }
           } catch (e) {
-            log('error', 'Folder picker failed: ' + e.message);
+            log('error', 'Folder picker failed: ' + errStr(e));
           }
         }
         
@@ -840,9 +877,9 @@ const App = (() => {
       log('success', `Found ${devices.length} device(s)`);
 
     } catch (e) {
-      log('error', 'Device scan failed: ' + e.message);
+      log('error', 'Device scan failed: ' + errStr(e));
       select.innerHTML = '<option value="">Detection failed</option>';
-      if (interactive) toast('error', e.message);
+      if (interactive) toast('error', errStr(e));
     }
   }
 
@@ -909,8 +946,9 @@ const App = (() => {
       }
       renderDeviceGames();
     } catch (e) {
-      container.innerHTML = `<div style="text-align:center;color:var(--color-error);font-size:var(--text-sm);padding:var(--space-4)">${e.message}</div>`;
-      log('error', 'Game scan failed: ' + e.message);
+      const msg = errStr(e);
+      container.innerHTML = `<div style="text-align:center;color:var(--color-error);font-size:var(--text-sm);padding:var(--space-4)">${msg}</div>`;
+      log('error', 'Game scan failed: ' + msg);
     }
   }
 
@@ -984,8 +1022,8 @@ const App = (() => {
       log('info', `Deleted: ${title} (${gameId})`);
       refreshDeviceGames();
     } catch (e) {
-      toast('error', `Delete failed: ${e.message}`);
-      log('error', `Delete failed: ${e.message}`);
+      toast('error', `Delete failed: ${errStr(e)}`);
+      log('error', `Delete failed: ${errStr(e)}`);
     }
   }
 
@@ -1034,8 +1072,8 @@ const App = (() => {
       log('info', `Renamed: ${oldTitle} → ${newTitle}`);
       refreshDeviceGames();
     } catch (e) {
-      toast('error', `Rename failed: ${e.message}`);
-      log('error', `Rename failed: ${e.message}`);
+      toast('error', `Rename failed: ${errStr(e)}`);
+      log('error', `Rename failed: ${errStr(e)}`);
     }
   }
 
@@ -1181,7 +1219,7 @@ const App = (() => {
           const n = await invoke('sort_ulcfg', { destDir: state.device.mount_point, sortBy });
           log('info', `ul.cfg sorted by "${sortBy}" (${n} entries)`);
         } catch (e) {
-          log('warn', 'Could not sort ul.cfg: ' + e.message);
+          log('warn', 'Could not sort ul.cfg: ' + errStr(e));
         }
       }
     });
@@ -1217,8 +1255,8 @@ const App = (() => {
         toast('success', `ul.cfg — ${result.entries} entries`);
         log('success', `ul.cfg: ${result.entries} entries`);
       } catch (e) {
-        toast('error', `ul.cfg failed: ${e.message}`);
-        log('error', `ul.cfg failed: ${e.message}`);
+        toast('error', `ul.cfg failed: ${errStr(e)}`);
+        log('error', `ul.cfg failed: ${errStr(e)}`);
       }
     });
     $('#btn-verify').addEventListener('click', async () => {
@@ -1261,8 +1299,9 @@ const App = (() => {
           toast('info', 'Not available in browser mode');
         }
       } catch (e) {
-        log('error', 'Contiguity check failed: ' + e.message);
-        toast('error', e.message);
+        const msg = e?.message ?? String(e);
+        log('error', 'Contiguity check failed: ' + msg);
+        toast('error', msg);
       }
     });
 
@@ -1294,8 +1333,8 @@ const App = (() => {
         }
         if (result.defragged > 0) refreshDeviceGames();
       } catch (e) {
-        log('error', 'Defrag failed: ' + e.message);
-        toast('error', 'Defrag failed: ' + e.message);
+        log('error', 'Defrag failed: ' + errStr(e));
+        toast('error', 'Defrag failed: ' + errStr(e));
       } finally {
         btn.disabled = false;
       }
@@ -1430,8 +1469,8 @@ const App = (() => {
         }
         refreshDeviceGames();
       } catch (e) {
-        log('error', 'Restore failed: ' + e.message);
-        toast('error', 'Restore failed: ' + e.message);
+        log('error', 'Restore failed: ' + errStr(e));
+        toast('error', 'Restore failed: ' + errStr(e));
       } finally {
         restoreState.running = false;
         if (restoreState.unlisten) { restoreState.unlisten(); restoreState.unlisten = null; }
@@ -1474,8 +1513,8 @@ const App = (() => {
           toast('info', 'Not available in browser mode');
         }
       } catch (e) {
-        log('error', 'Format failed: ' + e.message);
-        toast('error', e.message);
+        log('error', 'Format failed: ' + errStr(e));
+        toast('error', errStr(e));
       }
     });
 

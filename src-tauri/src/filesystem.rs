@@ -233,35 +233,67 @@ fn get_device_info_macos(mount_point: &Path) -> Result<DeviceInfo, FsError> {
 
 // ── Windows implementation ──
 
+/// Returns DRIVE_REMOVABLE (2) or DRIVE_FIXED (3) etc. for a root path like "E:\\".
+/// Uses `GetDriveTypeW` — available on all Windows versions, no wmic dependency.
+#[cfg(target_os = "windows")]
+fn get_drive_type_windows(root: &str) -> u32 {
+    use windows_sys::Win32::Storage::FileSystem::GetDriveTypeW;
+    let mut wide: Vec<u16> = root.encode_utf16().collect();
+    wide.push(0);
+    unsafe { GetDriveTypeW(wide.as_ptr()) }
+}
+
 #[cfg(target_os = "windows")]
 fn detect_devices_windows() -> Result<Vec<DeviceInfo>, FsError> {
-    use std::process::Command;
+    use windows_sys::Win32::Storage::FileSystem::GetLogicalDriveStringsW;
 
-    let output = Command::new("wmic")
-        .args([
-            "logicaldisk",
-            "where",
-            "DriveType=2",
-            "get",
-            "DeviceID,FileSystem,FreeSpace,Size,VolumeName",
-            "/format:csv",
-        ])
-        .output()
-        .map_err(|e| FsError::DetectionFailed(e.to_string()))?;
+    // GetLogicalDriveStringsW fills a buffer with null-separated drive root strings
+    // like "C:\\\0D:\\\0E:\\\0\0". Works on all Windows versions without wmic.
+    let mut buf = vec![0u16; 512];
+    let len = unsafe { GetLogicalDriveStringsW(buf.len() as u32, buf.as_mut_ptr()) };
+    if len == 0 {
+        return Err(FsError::DetectionFailed(
+            "GetLogicalDriveStringsW failed".into(),
+        ));
+    }
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    // Get the Windows system drive (usually "C:") so we can exclude it.
+    // External HDDs show up as DRIVE_FIXED just like C:\, so we exclude by drive
+    // letter rather than by type.
+    let sys_drive = std::env::var("SYSTEMDRIVE")
+        .unwrap_or_else(|_| "C:".into())
+        .to_uppercase();
+
     let mut devices = Vec::new();
+    let mut start = 0usize;
+    while start < len as usize {
+        let end = buf[start..]
+            .iter()
+            .position(|&c| c == 0)
+            .map(|p| start + p)
+            .unwrap_or(len as usize);
+        if end == start {
+            break;
+        }
+        let root = String::from_utf16_lossy(&buf[start..end]);
+        start = end + 1;
 
-    for line in stdout.lines().skip(1) {
-        // Skip header
-        let parts: Vec<&str> = line.split(',').collect();
-        if parts.len() >= 6 {
-            let mount = parts[1].trim();
-            if !mount.is_empty() {
-                if let Ok(info) = get_device_info_windows(Path::new(mount)) {
-                    devices.push(info);
-                }
-            }
+        let drive_type = get_drive_type_windows(&root);
+        // Include removable (USB flash) and fixed (external HDD) drives.
+        // Exclude optical (5), network (4), RAM disk (6), and the Windows system drive.
+        const DRIVE_REMOVABLE: u32 = 2;
+        const DRIVE_FIXED: u32 = 3;
+        if drive_type != DRIVE_REMOVABLE && drive_type != DRIVE_FIXED {
+            continue;
+        }
+        // Skip the system drive (C:\ by default) to prevent accidental writes.
+        let root_drive = root.trim_end_matches('\\').to_uppercase();
+        if root_drive == sys_drive {
+            continue;
+        }
+
+        if let Ok(info) = get_device_info_windows(Path::new(&root)) {
+            devices.push(info);
         }
     }
 
@@ -270,63 +302,61 @@ fn detect_devices_windows() -> Result<Vec<DeviceInfo>, FsError> {
 
 #[cfg(target_os = "windows")]
 fn get_device_info_windows(mount_point: &Path) -> Result<DeviceInfo, FsError> {
-    use std::process::Command;
+    use windows_sys::Win32::Foundation::MAX_PATH;
+    use windows_sys::Win32::Storage::FileSystem::GetVolumeInformationW;
 
-    let drive = mount_point
-        .to_str()
-        .unwrap_or("")
-        .chars()
-        .take(2)
-        .collect::<String>();
+    let mount_str = mount_point.to_string_lossy();
+    let drive = mount_str.chars().take(2).collect::<String>(); // e.g. "E:"
 
-    // wmic CSV columns (with Node prepended by wmic):
-    //   0:Node  1:FileSystem  2:FreeSpace  3:Size  4:VolumeName
-    //
-    // wmic output varies by Windows version — it may start with a blank line,
-    // then a header row, then the data row. Skip any line that isn't parseable
-    // data (i.e. whose numeric fields can't be parsed as u64).
-    let fs_result = Command::new("wmic")
-        .args([
-            "logicaldisk",
-            "where",
-            &format!("DeviceID='{}'", drive),
-            "get",
-            "FileSystem,FreeSpace,Size,VolumeName",
-            "/format:csv",
-        ])
-        .output();
+    // Build a root path with trailing backslash for Win32 APIs.
+    let root = if mount_str.ends_with('\\') {
+        mount_str.to_string()
+    } else {
+        format!("{}\\", mount_str)
+    };
+
+    // GetVolumeInformationW — returns volume label and filesystem name.
+    let mut label_buf = vec![0u16; MAX_PATH as usize + 1];
+    let mut fs_name_buf = vec![0u16; 32];
+    let mut wide_root: Vec<u16> = root.encode_utf16().collect();
+    wide_root.push(0);
 
     let mut filesystem = FilesystemType::Unknown("Unknown".into());
     let mut vol_name = String::new();
 
-    if let Ok(output) = fs_result {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Find the first line that has ≥5 fields AND a parseable Size column (index 3).
-        for line in stdout.lines() {
-            let parts: Vec<&str> = line.split(',').collect();
-            if parts.len() < 5 {
-                continue;
-            }
-            // If parts[3] (Size) parses as u64 it's a data row, not the header.
-            if parts[3].trim().parse::<u64>().is_err() {
-                continue;
-            }
-            filesystem = match parts[1].trim().to_uppercase().as_str() {
-                "FAT32" => FilesystemType::Fat32,
-                "NTFS" => FilesystemType::Ntfs,
-                "EXFAT" => FilesystemType::ExFat,
-                other => FilesystemType::Unknown(other.to_string()),
-            };
-            vol_name = parts[4].trim().to_string();
-            break;
-        }
+    let ok = unsafe {
+        GetVolumeInformationW(
+            wide_root.as_ptr(),
+            label_buf.as_mut_ptr(),
+            label_buf.len() as u32,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fs_name_buf.as_mut_ptr(),
+            fs_name_buf.len() as u32,
+        )
+    };
+    if ok != 0 {
+        let label_end = label_buf.iter().position(|&c| c == 0).unwrap_or(0);
+        vol_name = String::from_utf16_lossy(&label_buf[..label_end]);
+
+        let fs_end = fs_name_buf.iter().position(|&c| c == 0).unwrap_or(0);
+        let fs_str = String::from_utf16_lossy(&fs_name_buf[..fs_end]);
+        filesystem = match fs_str.to_uppercase().as_str() {
+            "FAT32" => FilesystemType::Fat32,
+            "NTFS" => FilesystemType::Ntfs,
+            "EXFAT" => FilesystemType::ExFat,
+            other => FilesystemType::Unknown(other.to_string()),
+        };
     }
 
-    // Use GetDiskFreeSpaceEx for reliable space info — wmic parsing is fragile.
     let (free_space, total_space) = get_space_info(mount_point);
-
     let recommended_mode = filesystem.recommended_mode().to_string();
     let name = if vol_name.is_empty() { drive } else { vol_name };
+
+    // DRIVE_REMOVABLE = 2 (USB flash), DRIVE_CDROM = 5.
+    const DRIVE_REMOVABLE: u32 = 2;
+    let is_removable = get_drive_type_windows(&root) == DRIVE_REMOVABLE;
 
     Ok(DeviceInfo {
         name,
@@ -334,7 +364,7 @@ fn get_device_info_windows(mount_point: &Path) -> Result<DeviceInfo, FsError> {
         filesystem,
         free_space,
         total_space,
-        is_removable: true,
+        is_removable,
         recommended_mode,
     })
 }
@@ -774,11 +804,20 @@ fn get_extent_count(path: &Path) -> Result<u32, FsError> {
         starting_vcn: i64,
     }
 
+    // Must match Windows RETRIEVAL_POINTERS_BUFFER exactly — DWORD + pad + LARGE_INTEGER
+    // + at least one Extents entry (2 × LARGE_INTEGER). Total: 32 bytes.
+    // Without the extents field the buffer is only 16 bytes, which causes
+    // DeviceIoControl to return ERROR_INSUFFICIENT_BUFFER (122) rather than
+    // ERROR_MORE_DATA (234), so the old code treated every file as an error.
     #[repr(C)]
     struct RetrievalPointersBuffer {
         extent_count: u32,
+        _pad: u32,
         starting_vcn: i64,
-        // Extents array follows, but we only need the count
+        // One extent entry so the buffer meets the RETRIEVAL_POINTERS_BUFFER minimum.
+        // We only need ExtentCount so we never read these fields.
+        _next_vcn: i64,
+        _lcn: i64,
     }
 
     let file = std::fs::File::open(path).map_err(FsError::Io)?;
@@ -803,8 +842,11 @@ fn get_extent_count(path: &Path) -> Result<u32, FsError> {
 
     if ret == 0 {
         let err = std::io::Error::last_os_error();
-        // ERROR_MORE_DATA (234) means buffer too small but extent_count is valid
-        if err.raw_os_error() != Some(234) {
+        // ERROR_MORE_DATA (234): buffer too small for all extents but ExtentCount is valid.
+        // ERROR_INSUFFICIENT_BUFFER (122): should not happen with our 32-byte buffer
+        // unless the file has zero extents — treat as contiguous.
+        let code = err.raw_os_error().unwrap_or(0);
+        if code != 234 && code != 122 {
             return Err(FsError::DetectionFailed(format!(
                 "FSCTL_GET_RETRIEVAL_POINTERS failed: {}",
                 err
